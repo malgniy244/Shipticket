@@ -200,3 +200,24 @@ Acceptance criteria: 5 named blocks, 0 unmatched blocks, no hard flags, `INHERIT
 - Whitelist-only assignment rule enforced at both UI layer (dropdown cannot commit non-whitelist text) and server layer (reassign endpoint validates against whitelist).
 - Any reassignment re-derives flags server-side via the existing re-pool endpoint (unchanged).
 - MISSING_TICKET and conflict checks unchanged — the reconciliation screen is their visual surface, not a replacement.
+
+### Decision 11: Sender Tool — Graph Device-Code Flow; SMTP & COM Permanently Rejected (2026-07-10)
+
+**Context:** Task 6 (ship ticket email sender) was originally specced as Outlook COM automation. Two approaches were evaluated and rejected before the final approach was selected.
+
+**Rejected: Outlook COM**
+New Outlook (the version on the user's machine) dropped COM automation support. COM is unavailable on the target hardware. This is a permanent hardware constraint, not a configuration issue.
+
+**Rejected: SMTP basic auth**
+SMTP was proposed as an alternative but was permanently rejected on two grounds: (1) storing credentials (password or app password) in a desktop executable is a security violation the user explicitly refused; (2) Microsoft 365 tenants commonly have SMTP basic auth disabled by IT policy, making reliability uncertain. This deviation from the original spec was not flagged before being proposed — noted as a process failure; going forward, any departure from a LOCKED or specified approach must be raised before acting.
+
+**Selected: Microsoft Graph API, delegated Mail.Send, device-code flow**
+The user created an Azure app registration (Client ID: `61249134-e089-422b-bd52-688eb7cafa01`, Tenant ID: `893a34dd-cb02-4c70-957d-794446df8feb`, single-tenant, public client flows enabled, delegated `Mail.Send` permission). The sender tool uses MSAL device-code flow: no credentials stored anywhere, each user signs in via browser with normal MFA, token cached per-user in `~/.sts_sender/token_cache.json`.
+
+**Draft/EML fallback:** A draft-file generator was started but demoted to unpolished fallback code in the repo. It is not developed further.
+
+**Splitter feature-frozen:** The web splitter (Phase A/B + reconciliation) is feature-frozen as of this decision. No new features will be added. Remaining work: Render deployment and sender tool acceptance test.
+
+**Build distribution:** GitHub Actions workflow on `windows-latest` runner builds `STS-Sender.exe` (PyInstaller `--onefile --windowed`) on every push to `sender/`. Artifact retained 90 days. `build.bat` provided as emergency local fallback only. Canonical distribution is Actions artifacts / Releases.
+
+**Acceptance test (LOCKED):** The ZIP from the 17-page TIB fixture, unzipped and run through the exe on the user's machine, produces exactly 5 emails received at `cng@stacksbowers.com`, each with subject `123` and the correct attachment filename, and the user's Power Automate flow files all 5 to the correct SharePoint folders.
