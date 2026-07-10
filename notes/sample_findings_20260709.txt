@@ -1,0 +1,30 @@
+Source files:
+- /home/ubuntu/upload/pasted_content_4.txt
+- /home/ubuntu/upload/SKM_C250i26070917180.pdf (viewed pages 1-8)
+
+Key findings from user notes:
+1. Phase B currently violates spec: first page per block should be shown large and readable without extra click; current small thumbnail is inadequate.
+2. Phase B 'View pages' button is reported dead by user and must open filmstrip for that block.
+3. New required job-creation toggle: batch type = TIB or non-TIB. This affects proposal/prompt layer only, not core grouping/gating rules.
+4. TIB mode assumption: each ticket begins with 2 printed Ship Ticket cover pages, followed by listing/photo pages. Add a soft verification flag when a proposed block does not start with a printed cover.
+5. Non-TIB mode assumption: no cover requirement; add pink marker boundary support.
+6. Pink marker rule: bright pink/magenta rectangular sticker anywhere on page; boundary signal only, never identity; marker-only page should start its own block and remain unidentified if no resolvable ticket; marker pages are red pages in filmstrip.
+7. Need tests: fixture #5 should have zero cover-position soft flags in TIB mode; synthetic tests for marker+number, marker-only, and number-only-without-marker.
+8. Need DECISIONS.md updates for batch-type toggle and pink-marker proposal-layer rule.
+9. User also asked for Render deployment status because sandbox-specific issues are wasting debugging time.
+
+Observed PDF findings from /home/ubuntu/upload/SKM_C250i26070917180.pdf:
+- Total pages viewed: pages 1-8 of 17-page PDF.
+- Page 1: printed Ship Ticket cover for ticket 248258 with a bright pink rectangular sticker at bottom-right.
+- Page 2: second printed Ship Ticket cover for ticket 248258, no visible pink sticker.
+- Page 3: photo/listing page associated with 248258 (handwritten note at top references ST: 248258), no pink sticker visible.
+- Page 4: printed Ship Ticket cover for ticket 248256 with bright pink rectangular sticker at bottom-right.
+- Page 5: second printed Ship Ticket cover for ticket 248256, no visible pink sticker.
+- Pages 6-7: photo/listing pages associated with 248256, no pink sticker visible.
+- Page 8: printed Ship Ticket cover for ticket 248259 with bright pink rectangular sticker at bottom-right.
+
+Interpretation from sample:
+- Pink sticker appears on the first printed cover page of each block, supporting the user's proposed non-TIB boundary-marker convention.
+- The sample still uses printed covers, so it is visually similar to TIB structure while also demonstrating the pink-marker pattern.
+- A usable detector schema extension is likely: pink_marker: boolean in per-page detection output.
+- For proposal logic, block starts can be suggested by either strong ticket-detection evidence or pink marker, depending on batch type and available evidence.

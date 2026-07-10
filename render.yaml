@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: ship-ticket-splitter
+    runtime: python
+    rootDir: webapp
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false   # set manually in Render dashboard
+      - key: APP_PASSWORD
+        sync: false   # set manually in Render dashboard
+      - key: SESSION_SECRET
+        generateValue: true
+    healthCheckPath: /api/me

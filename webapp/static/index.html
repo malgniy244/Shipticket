@@ -1,0 +1,1085 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ship Ticket Splitter</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --card: #ffffff; --border: #dde1e7;
+    --primary: #2563eb; --primary-dark: #1d4ed8;
+    --danger: #dc2626; --warn: #d97706; --success: #16a34a;
+    --soft: #6b7280; --radius: 8px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: #1f2937; min-height: 100vh; }
+
+  /* Login */
+  #login-screen { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+  .login-card { background: var(--card); border-radius: var(--radius); padding: 40px; width: 340px; box-shadow: 0 4px 24px rgba(0,0,0,.1); }
+  .login-card h1 { font-size: 1.4rem; margin-bottom: 8px; }
+  .login-card p { color: var(--soft); font-size: .9rem; margin-bottom: 24px; }
+  .login-card input { width: 100%; padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 1rem; margin-bottom: 12px; }
+  .login-card button { width: 100%; padding: 10px; background: var(--primary); color: #fff; border: none; border-radius: 6px; font-size: 1rem; cursor: pointer; }
+  .login-card button:hover { background: var(--primary-dark); }
+
+  /* App shell */
+  #app { display: none; flex-direction: column; min-height: 100vh; }
+  .topbar { background: var(--card); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; align-items: center; gap: 16px; flex-shrink: 0; }
+  .topbar h1 { font-size: 1.1rem; font-weight: 700; flex: 1; }
+  .topbar button { padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); cursor: pointer; font-size: .85rem; }
+  .topbar button:hover { background: var(--bg); }
+  .main { flex: 1; padding: 24px; max-width: 1400px; margin: 0 auto; width: 100%; }
+
+  /* New Job */
+  #new-job-screen .card { background: var(--card); border-radius: var(--radius); padding: 28px; max-width: 560px; box-shadow: 0 2px 8px rgba(0,0,0,.06); }
+  #new-job-screen h2 { font-size: 1.2rem; margin-bottom: 20px; }
+  .field { margin-bottom: 18px; }
+  .field label { display: block; font-size: .85rem; font-weight: 600; margin-bottom: 6px; }
+  .field label .req { color: var(--danger); }
+  .field textarea, .field input[type=file] { width: 100%; padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: .9rem; font-family: monospace; }
+  .field textarea { resize: vertical; min-height: 80px; }
+  .field .hint { font-size: .78rem; color: var(--soft); margin-top: 4px; }
+  .batch-type-group { display: flex; gap: 10px; }
+  .batch-type-btn { flex: 1; padding: 10px 12px; border: 2px solid var(--border); border-radius: 6px; background: var(--card); cursor: pointer; font-size: .9rem; font-weight: 600; text-align: center; transition: border-color .15s, background .15s; }
+  .batch-type-btn:hover { border-color: var(--primary); }
+  .batch-type-btn.selected { border-color: var(--primary); background: #eff6ff; color: var(--primary); }
+  .btn-primary { padding: 10px 24px; background: var(--primary); color: #fff; border: none; border-radius: 6px; font-size: 1rem; cursor: pointer; }
+  .btn-primary:hover { background: var(--primary-dark); }
+  .btn-primary:disabled { opacity: .5; cursor: not-allowed; }
+
+  /* Progress */
+  #progress-screen .card { background: var(--card); border-radius: var(--radius); padding: 32px; max-width: 480px; box-shadow: 0 2px 8px rgba(0,0,0,.06); }
+  .progress-bar-outer { background: var(--border); border-radius: 99px; height: 10px; overflow: hidden; margin: 12px 0 8px; }
+  .progress-bar-inner { background: var(--primary); height: 100%; border-radius: 99px; transition: width .3s; }
+  .progress-label { font-size: .85rem; color: var(--soft); }
+
+  /* Phase A */
+  .phase-header { display: flex; align-items: center; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+  .phase-header h2 { font-size: 1.2rem; font-weight: 700; }
+  .phase-desc { font-size: .88rem; color: var(--soft); flex: 1; min-width: 200px; }
+  .btn-success { padding: 10px 24px; background: var(--success); color: #fff; border: none; border-radius: 6px; font-size: .95rem; cursor: pointer; font-weight: 600; }
+  .btn-success:hover { background: #15803d; }
+  .btn-outline { padding: 8px 18px; background: var(--card); color: var(--primary); border: 1px solid var(--primary); border-radius: 6px; font-size: .9rem; cursor: pointer; }
+  .btn-outline:hover { background: #eff6ff; }
+
+  /* Thumbnail grid */
+  .thumb-grid { display: flex; flex-wrap: wrap; gap: 0; align-items: flex-start; }
+  .thumb-cell { display: flex; flex-direction: column; align-items: center; }
+  .thumb-img-wrap { width: 100px; height: 140px; border: 2px solid var(--border); border-radius: 4px; overflow: hidden; background: #e5e7eb; cursor: pointer; transition: border-color .15s; }
+  .thumb-img-wrap:hover { border-color: var(--primary); }
+  .thumb-img-wrap img { width: 100%; height: 100%; object-fit: contain; }
+  .thumb-page-num { font-size: .7rem; color: var(--soft); margin-top: 3px; }
+  .thumb-ticket-label { font-size: .68rem; font-weight: 600; color: var(--primary); margin-top: 1px; max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center; }
+  .block-band { height: 5px; border-radius: 3px; margin-top: 3px; width: 100px; }
+  .divider-zone { width: 24px; display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; position: relative; }
+  .divider-line { width: 3px; height: 140px; background: transparent; border-radius: 2px; transition: background .15s; }
+  .divider-zone:hover .divider-line { background: var(--primary); }
+  .divider-zone.has-divider .divider-line { background: var(--primary); }
+  .divider-btn { position: absolute; top: 50%; transform: translateY(-50%); width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--primary); background: var(--card); display: flex; align-items: center; justify-content: center; font-size: .75rem; color: var(--primary); opacity: 0; transition: opacity .15s; }
+  .divider-zone.has-divider .divider-btn, .divider-zone:hover .divider-btn { opacity: 1; }
+  .divider-btn:hover { background: var(--primary); color: #fff; }
+
+  /* ── Phase B: Full-screen confirmation ── */
+  #phase-b-screen { display: none; flex-direction: column; height: calc(100vh - 53px); overflow: hidden; }
+  #phase-b-screen.visible { display: flex; }
+
+  /* Top bar */
+  .pb-topbar { background: var(--card); border-bottom: 1px solid var(--border); padding: 10px 20px; display: flex; align-items: center; gap: 16px; flex-shrink: 0; }
+  .pb-progress-text { font-size: .9rem; color: var(--soft); }
+  .pb-progress-text strong { color: #1f2937; }
+  .pb-escape-hint { font-size: .78rem; color: var(--soft); margin-left: auto; }
+
+  /* Block strip */
+  .pb-strip { background: var(--card); border-bottom: 1px solid var(--border); padding: 8px 20px; display: flex; gap: 4px; overflow-x: auto; flex-shrink: 0; align-items: center; }
+  .pb-strip-marker { width: 28px; height: 28px; border-radius: 4px; cursor: pointer; border: 2px solid transparent; display: flex; align-items: center; justify-content: center; font-size: .65rem; font-weight: 700; color: #fff; transition: border-color .15s, transform .1s; flex-shrink: 0; }
+  .pb-strip-marker:hover { border-color: #1f2937; transform: scale(1.1); }
+  .pb-strip-marker.current { border-color: #1f2937; transform: scale(1.15); }
+  .pb-strip-marker.confirmed { opacity: .55; }
+
+  /* Main content area */
+  .pb-body { flex: 1; display: flex; overflow: hidden; }
+
+  /* Left: page image column */
+  .pb-image-col { flex: 1; display: flex; flex-direction: column; overflow: hidden; background: #1a1a2e; }
+  .pb-image-nav { display: flex; align-items: center; justify-content: space-between; padding: 8px 16px; background: rgba(0,0,0,.4); flex-shrink: 0; }
+  .pb-image-nav button { background: rgba(255,255,255,.15); color: #fff; border: 1px solid rgba(255,255,255,.25); border-radius: 5px; padding: 4px 12px; cursor: pointer; font-size: .82rem; }
+  .pb-image-nav button:hover { background: rgba(255,255,255,.25); }
+  .pb-image-nav button:disabled { opacity: .3; cursor: default; }
+  .pb-image-nav .pb-page-label { color: rgba(255,255,255,.7); font-size: .82rem; }
+  .pb-image-wrap { flex: 1; overflow: auto; display: flex; align-items: flex-start; justify-content: center; padding: 0; }
+  .pb-image-wrap img { width: 100%; height: auto; display: block; border-radius: 0; border: none; cursor: zoom-in; }
+
+  /* Right: identity panel */
+  .pb-panel { width: 340px; flex-shrink: 0; background: var(--card); border-left: 1px solid var(--border); display: flex; flex-direction: column; overflow-y: auto; }
+  .pb-panel-inner { padding: 20px; flex: 1; }
+  .pb-ticket-label { font-size: .78rem; font-weight: 600; color: var(--soft); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 6px; }
+  .pb-ticket-value { font-size: 2rem; font-weight: 800; margin-bottom: 4px; line-height: 1.1; }
+  .pb-ticket-value.green { color: var(--success); }
+  .pb-ticket-value.red { color: var(--danger); }
+  .pb-ticket-value.unset { color: var(--danger); font-size: 1.2rem; font-style: italic; }
+  .pb-source-line { font-size: .8rem; color: var(--soft); margin-bottom: 16px; }
+  .pb-flags { margin-bottom: 14px; }
+  .pb-flags .flag-badge { display: inline-block; padding: 2px 7px; border-radius: 99px; font-size: .72rem; font-weight: 600; margin-right: 3px; margin-bottom: 3px; }
+  .flag-hard { background: #fee2e2; color: #991b1b; }
+  .flag-soft { background: #fef9c3; color: #92400e; }
+  .flag-info { background: #dbeafe; color: #1e40af; }
+
+  /* Identity control */
+  .pb-identity-section { margin-top: 4px; }
+  .pb-identity-label { font-size: .78rem; font-weight: 600; color: var(--soft); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 6px; }
+  .pb-identity-input-wrap { position: relative; }
+  .pb-identity-input { width: 100%; padding: 9px 12px; border: 2px solid var(--border); border-radius: 6px; font-size: 1rem; font-family: monospace; font-weight: 600; outline: none; }
+  .pb-identity-input:focus { border-color: var(--primary); }
+  .pb-identity-input.invalid { border-color: var(--danger); }
+  .pb-dropdown { position: absolute; top: 100%; left: 0; right: 0; background: var(--card); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 4px 16px rgba(0,0,0,.12); z-index: 200; max-height: 200px; overflow-y: auto; display: none; }
+  .pb-dropdown.open { display: block; }
+  .pb-dropdown-item { padding: 8px 12px; cursor: pointer; font-size: .92rem; font-family: monospace; }
+  .pb-dropdown-item:hover, .pb-dropdown-item.focused { background: #eff6ff; color: var(--primary); }
+  .pb-identity-hint { font-size: .75rem; color: var(--soft); margin-top: 4px; }
+  .pb-identity-hint.error { color: var(--danger); }
+
+  /* Navigation buttons */
+  .pb-nav-btns { padding: 16px 20px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; }
+  .pb-nav-btns .btn-confirm-block { padding: 11px; background: var(--success); color: #fff; border: none; border-radius: 6px; font-size: .95rem; cursor: pointer; font-weight: 700; width: 100%; }
+  .pb-nav-btns .btn-confirm-block:hover { background: #15803d; }
+  .pb-nav-btns .btn-confirm-block:disabled { opacity: .4; cursor: not-allowed; }
+  .pb-nav-btns .pb-nav-row { display: flex; gap: 8px; }
+  .pb-nav-btns .btn-nav { flex: 1; padding: 8px; background: var(--bg); color: #1f2937; border: 1px solid var(--border); border-radius: 6px; font-size: .85rem; cursor: pointer; }
+  .pb-nav-btns .btn-nav:hover { border-color: var(--primary); color: var(--primary); }
+  .pb-nav-btns .btn-nav:disabled { opacity: .35; cursor: default; }
+  .pb-keyboard-hint { font-size: .72rem; color: var(--soft); text-align: center; padding: 0 20px 12px; }
+
+  /* ── Reconciliation screen ── */
+  #reconcile-screen { display: none; }
+  #reconcile-screen.visible { display: block; }
+  .reconcile-header { margin-bottom: 24px; }
+  .reconcile-header h2 { font-size: 1.4rem; font-weight: 800; margin-bottom: 6px; }
+  .reconcile-checks { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  .check-pill { padding: 6px 14px; border-radius: 99px; font-size: .85rem; font-weight: 700; }
+  .check-pill.pass { background: #dcfce7; color: #15803d; }
+  .check-pill.fail { background: #fee2e2; color: #991b1b; }
+  .reconcile-headline { font-size: 1rem; color: var(--soft); margin-bottom: 20px; }
+  .reconcile-table { width: 100%; border-collapse: collapse; background: var(--card); border-radius: var(--radius); overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,.06); }
+  .reconcile-table th { background: var(--bg); font-size: .78rem; font-weight: 700; color: var(--soft); text-transform: uppercase; letter-spacing: .05em; padding: 10px 16px; text-align: left; border-bottom: 1px solid var(--border); }
+  .reconcile-table td { padding: 10px 16px; border-bottom: 1px solid var(--border); font-size: .9rem; vertical-align: middle; }
+  .reconcile-table tr:last-child td { border-bottom: none; }
+  .reconcile-table tr.row-fail td { background: #fff5f5; }
+  .reconcile-table tr.row-ok td { background: #f0fdf4; }
+  .reconcile-mini-thumb { width: 40px; height: 56px; object-fit: contain; border: 1px solid var(--border); border-radius: 3px; }
+  .reconcile-actions { margin-top: 24px; display: flex; gap: 12px; align-items: center; }
+  .btn-confirm-download { padding: 12px 32px; background: var(--success); color: #fff; border: none; border-radius: 6px; font-size: 1rem; cursor: pointer; font-weight: 700; }
+  .btn-confirm-download:hover { background: #15803d; }
+  .btn-confirm-download:disabled { opacity: .4; cursor: not-allowed; }
+  .reconcile-status-text { font-size: .88rem; color: var(--soft); }
+
+  /* Source badges */
+  .source-badge { display: inline-block; padding: 2px 7px; border-radius: 99px; font-size: .72rem; font-weight: 600; margin-right: 3px; margin-bottom: 4px; }
+  .src-printed { background: #dbeafe; color: #1e40af; }
+  .src-sticker { background: #e0e7ff; color: #3730a3; }
+  .src-handwritten { background: #fef9c3; color: #92400e; }
+  .src-second-pass { background: #f3e8ff; color: #6b21a8; }
+  .src-inherited { background: #f3f4f6; color: #6b7280; }
+
+  /* Filmstrip modal */
+  #filmstrip-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.75); z-index: 99999; }
+  .modal-inner { background: var(--card); border-radius: var(--radius); width: 95vw; max-width: 860px; height: 90vh; margin: 5vh auto; display: flex; flex-direction: column; overflow: hidden; }
+  .modal-header { padding: 12px 18px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 10px; }
+  .modal-header h3 { flex: 1; font-size: .95rem; }
+  .modal-header button { padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--card); cursor: pointer; font-size: .82rem; }
+  .filmstrip-body { flex: 1; display: flex; overflow: hidden; }
+  .filmstrip-strip { width: 90px; border-right: 1px solid var(--border); overflow-y: auto; padding: 6px 3px; flex-shrink: 0; }
+  .strip-thumb { width: 80px; height: 55px; object-fit: contain; border: 2px solid transparent; border-radius: 3px; cursor: pointer; margin-bottom: 3px; display: block; }
+  .strip-thumb.active { border-color: var(--primary); }
+  .filmstrip-main { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; align-items: center; }
+  .filmstrip-main img { max-width: 100%; border: 1px solid var(--border); border-radius: 4px; }
+  .filmstrip-page-info { margin-top: 8px; font-size: .82rem; color: var(--soft); text-align: center; }
+
+  /* Enlarge */
+  #enlarge-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.88); z-index: 99998; overflow: auto; cursor: zoom-out; }
+  #enlarge-modal .enlarge-inner { min-height: 100%; display: flex; align-items: flex-start; justify-content: center; padding: 20px; }
+  #enlarge-modal img { width: 200%; max-width: none; border-radius: 4px; cursor: zoom-out; }
+
+  /* Misc */
+  .error-msg { color: var(--danger); font-size: .85rem; margin-top: 6px; }
+  .hidden { display: none !important; }
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--primary); border-radius: 50%; animation: spin .6s linear infinite; vertical-align: middle; margin-right: 5px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<div id="login-screen">
+  <div class="login-card">
+    <h1>Ship Ticket Splitter</h1>
+    <p>Enter your password to continue.</p>
+    <input type="password" id="login-pw" placeholder="Password" autocomplete="current-password">
+    <button id="login-btn">Sign in</button>
+    <div class="error-msg hidden" id="login-error">Incorrect password.</div>
+  </div>
+</div>
+
+<div id="app">
+  <div class="topbar">
+    <h1>Ship Ticket Splitter</h1>
+    <button id="new-job-btn">+ New Job</button>
+    <button id="logout-btn">Sign out</button>
+  </div>
+  <div class="main" id="main-area">
+
+    <div id="new-job-screen">
+      <div class="card">
+        <h2>New Splitting Job</h2>
+        <div class="field">
+          <label>Batch type <span class="req">*</span></label>
+          <div class="batch-type-group">
+            <button class="batch-type-btn" id="bt-tib" data-value="tib">
+              TIB<br><span style="font-size:.75rem;font-weight:400;color:var(--soft)">Printed cover pages per ticket</span>
+            </button>
+            <button class="batch-type-btn" id="bt-nontib" data-value="non_tib">
+              Non-TIB<br><span style="font-size:.75rem;font-weight:400;color:var(--soft)">Pink sticker boundary markers</span>
+            </button>
+          </div>
+          <div class="hint">TIB: each ticket starts with 2 printed Ship Ticket cover pages. Non-TIB: first page of each ticket has a bright pink rectangular sticker.</div>
+        </div>
+        <div class="field">
+          <label>Whitelist <span class="req">*</span></label>
+          <textarea id="wl-input" placeholder="301532, 257535, 253983, 258066, 257086&#10;One per line or comma-separated — must include ALL tickets in this scan"></textarea>
+          <div class="hint">5&#8211;7 digit numbers, optionally with suffix (e.g. 253027-1). Include every ticket number present in the scan.</div>
+        </div>
+        <div class="field">
+          <label>Merged scan PDF <span class="req">*</span></label>
+          <input type="file" id="pdf-input" accept=".pdf">
+        </div>
+        <div class="error-msg hidden" id="job-error"></div>
+        <button class="btn-primary" id="submit-job-btn" disabled>Start Detection</button>
+      </div>
+    </div>
+
+    <div id="progress-screen" class="hidden">
+      <div class="card">
+        <h2 id="progress-title">Processing&#8230;</h2>
+        <div class="progress-bar-outer">
+          <div class="progress-bar-inner" id="progress-bar" style="width:0%"></div>
+        </div>
+        <div class="progress-label" id="progress-label">Starting&#8230;</div>
+      </div>
+    </div>
+
+    <div id="phase-a-screen" class="hidden">
+      <div class="phase-header">
+        <h2>Phase A &mdash; Boundary Review</h2>
+        <div class="phase-desc">Click a gap between pages to add or remove a split divider. Dividers define where one ticket ends and the next begins. Ticket labels update automatically.</div>
+        <button class="btn-success" id="confirm-boundaries-btn">Confirm Boundaries &rarr;</button>
+      </div>
+      <div id="thumb-grid" class="thumb-grid"></div>
+    </div>
+
+    <!-- Reconciliation screen (inside .main) -->
+    <div id="reconcile-screen">
+      <div class="reconcile-header">
+        <h2 id="reconcile-title">Batch Reconciliation</h2>
+        <div class="reconcile-checks" id="reconcile-checks"></div>
+        <div class="reconcile-headline" id="reconcile-headline"></div>
+      </div>
+      <table class="reconcile-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Whitelist Ticket</th>
+            <th>Confirmed Block</th>
+            <th>Pages</th>
+            <th>First Page</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="reconcile-tbody"></tbody>
+      </table>
+      <div class="reconcile-actions">
+        <button class="btn-confirm-download" id="final-confirm-btn" disabled>Confirm &amp; Download ZIP</button>
+        <span class="reconcile-status-text" id="reconcile-status-text"></span>
+      </div>
+    </div>
+
+  </div><!-- /.main -->
+
+  <!-- Phase B: full-screen, outside .main so it can fill the viewport -->
+  <div id="phase-b-screen">
+    <!-- Top progress bar -->
+    <div class="pb-topbar">
+      <div class="pb-progress-text" id="pb-progress-text"></div>
+      <button class="btn-outline" id="pb-back-btn" style="font-size:.82rem;padding:5px 12px;">&larr; Edit Boundaries (Esc)</button>
+    </div>
+    <!-- Block strip -->
+    <div class="pb-strip" id="pb-strip"></div>
+    <!-- Body -->
+    <div class="pb-body">
+      <!-- Left: image -->
+      <div class="pb-image-col">
+        <div class="pb-image-nav">
+          <button id="pb-page-prev" disabled>&uarr; Prev page</button>
+          <span class="pb-page-label" id="pb-page-label"></span>
+          <button id="pb-page-next" disabled>&darr; Next page</button>
+        </div>
+        <div class="pb-image-wrap">
+          <img id="pb-main-img" src="" alt="Page" title="Click to enlarge">
+        </div>
+      </div>
+      <!-- Right: identity panel -->
+      <div class="pb-panel">
+        <div class="pb-panel-inner">
+          <div class="pb-ticket-label">Identified Ticket</div>
+          <div class="pb-ticket-value" id="pb-ticket-value"></div>
+          <div class="pb-source-line" id="pb-source-line"></div>
+          <div class="pb-flags" id="pb-flags"></div>
+          <div class="pb-identity-section">
+            <div class="pb-identity-label">Assign / Reassign</div>
+            <div class="pb-identity-input-wrap">
+              <input type="text" class="pb-identity-input" id="pb-identity-input" placeholder="Type to filter whitelist…" autocomplete="off" spellcheck="false">
+              <div class="pb-dropdown" id="pb-dropdown"></div>
+            </div>
+            <div class="pb-identity-hint" id="pb-identity-hint">Type a whitelist ticket number, then press Enter to commit.</div>
+          </div>
+        </div>
+        <div class="pb-nav-btns">
+          <button class="btn-confirm-block" id="pb-confirm-btn">Confirm &amp; Next &rarr;</button>
+          <div class="pb-nav-row">
+            <button class="btn-nav" id="pb-prev-block-btn">&larr; Prev block</button>
+            <button class="btn-nav" id="pb-next-block-btn">Next block &rarr;</button>
+          </div>
+        </div>
+        <div class="pb-keyboard-hint">
+          <strong>&rarr;</strong> confirm &amp; next &nbsp;|&nbsp; <strong>&larr;</strong> prev block &nbsp;|&nbsp; <strong>&darr;/&uarr;</strong> page &nbsp;|&nbsp; <strong>Enter</strong> commit identity &nbsp;|&nbsp; <strong>Esc</strong> back to Phase A
+        </div>
+      </div>
+    </div>
+  </div><!-- /#phase-b-screen -->
+
+</div><!-- /#app -->
+
+<div id="filmstrip-modal">
+  <div class="modal-inner">
+    <div class="modal-header">
+      <h3 id="filmstrip-title">Page viewer</h3>
+      <button id="filmstrip-prev">&larr; Prev</button>
+      <button id="filmstrip-next">Next &rarr;</button>
+      <button id="filmstrip-close">&#x2715; Close</button>
+    </div>
+    <div class="filmstrip-body">
+      <div class="filmstrip-strip" id="filmstrip-strip"></div>
+      <div class="filmstrip-main">
+        <img id="filmstrip-img" src="" alt="Page">
+        <div class="filmstrip-page-info" id="filmstrip-page-info"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="enlarge-modal">
+  <div class="enlarge-inner">
+    <img id="enlarge-img" src="" alt="">
+  </div>
+</div>
+
+<script>
+const BLOCK_COLORS = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#ec4899','#84cc16','#f97316','#6366f1'];
+const HARD_FLAGS = ['UNMATCHED_NUMBER','AMBIGUOUS_SUFFIX','AMBIGUOUS_MATCH','ORPHAN_LEADING_PAGES','CORRECTION_CONFLICT'];
+const SOFT_FLAGS = ['FUZZY_RESOLVED','SECOND_PASS','INHERITED_UNMATCHED','LOW_CONFIDENCE','CORRECTION_OBSERVED','NON_CONTIGUOUS','NO_PRINTED_COVER','PINK_MARKER'];
+
+let jobId = null, totalPages = 0, whitelist = [], batchType = null;
+let reviewState = null, boundaries = [], repoolTimer = null;
+let filmstripPages = [], filmstripCurrent = 0;
+
+// ── Phase B state ──
+let pbBlocks = [];          // ordered block list from reviewState
+let pbCurrentBlock = 0;     // index into pbBlocks
+let pbCurrentPageIdx = 0;   // index into pbBlocks[pbCurrentBlock].pages
+let pbConfirmed = {};        // blockId → true (confirmed by user)
+let pbAssigned = {};         // blockId → ticket (user override; null = use server value)
+let pbDropdownFocused = -1;  // index of focused dropdown item
+
+function el(id) { return document.getElementById(id); }
+function show(id) { const e=el(id); e.classList.remove('hidden'); if(e.style.display==='none') e.style.display=''; }
+function hide(id) { el(id).classList.add('hidden'); }
+
+function flagLabel(f) {
+  return {
+    UNMATCHED_NUMBER:'UNMATCHED', AMBIGUOUS_SUFFIX:'AMBIGUOUS SUFFIX', AMBIGUOUS_MATCH:'AMBIGUOUS MATCH',
+    ORPHAN_LEADING_PAGES:'ORPHAN', CORRECTION_CONFLICT:'CONFLICT \u2014 MISSED BOUNDARY?',
+    FUZZY_RESOLVED:'FUZZY RESOLVED', SECOND_PASS:'SECOND PASS', INHERITED_UNMATCHED:'INHERITED (UNMATCHED)',
+    LOW_CONFIDENCE:'LOW CONFIDENCE', CORRECTION_OBSERVED:'CORRECTION OBSERVED',
+    NON_CONTIGUOUS:'NON-CONTIGUOUS', MISSING_TICKET:'MISSING TICKET',
+    NO_PRINTED_COVER:'NO PRINTED COVER \u2014 VERIFY BOUNDARY',
+    PINK_MARKER:'PINK MARKER (boundary signal)',
+  }[f] || f;
+}
+function flagClass(f) { return HARD_FLAGS.includes(f)?'flag-hard':SOFT_FLAGS.includes(f)?'flag-soft':'flag-info'; }
+function srcClass(s) { return {printed:'src-printed',sticker:'src-sticker',handwritten:'src-handwritten','second-pass':'src-second-pass'}[s]||'src-inherited'; }
+function thumbUrl(p) { return `/api/jobs/${jobId}/thumbnail/${p}`; }
+function pageUrl(p) { return `/api/jobs/${jobId}/page/${p}/image`; }
+
+async function api(method, path, body) {
+  const opts = {method, headers:{}};
+  if (body) { opts.body = JSON.stringify(body); opts.headers['Content-Type']='application/json'; }
+  const r = await fetch(path, opts);
+  if (r.status === 401) { alert('Session expired \u2014 please log in again.'); location.reload(); throw new Error('Session expired'); }
+  if (!r.ok) { const t = await r.text(); throw new Error(t.startsWith('<') ? 'Server error (unexpected HTML response)' : t); }
+  return r.json();
+}
+
+async function formApi(method, path, fields) {
+  const fd = new FormData();
+  for (const [k,v] of Object.entries(fields)) { if (v !== undefined && v !== null) fd.append(k, String(v)); }
+  const r = await fetch(path, {method, body: fd});
+  if (r.status === 401) { alert('Session expired \u2014 please log in again.'); location.reload(); throw new Error('Session expired'); }
+  if (!r.ok) { const t = await r.text(); throw new Error(t.startsWith('<') ? 'Server error (unexpected HTML response)' : t); }
+  return r.json();
+}
+
+// ── Auth ──
+async function checkAuth() {
+  const r = await fetch('/api/me'); const d = await r.json();
+  if (d.authenticated) showApp(); else show('login-screen');
+}
+el('login-pw').addEventListener('keydown', e => { if(e.key==='Enter') doLogin(); });
+el('login-btn').addEventListener('click', doLogin);
+async function doLogin() {
+  const fd = new FormData(); fd.append('password', el('login-pw').value);
+  const r = await fetch('/api/login',{method:'POST',body:fd});
+  if (r.ok) { hide('login-screen'); showApp(); }
+  else el('login-error').classList.remove('hidden');
+}
+el('logout-btn').addEventListener('click', async () => { await fetch('/api/logout',{method:'POST'}); location.reload(); });
+function showApp() { hide('login-screen'); el('app').style.display='flex'; showNewJob(); }
+
+// ── Batch type toggle ──
+['bt-tib','bt-nontib'].forEach(id => {
+  el(id).addEventListener('click', () => {
+    batchType = el(id).dataset.value;
+    el('bt-tib').classList.toggle('selected', batchType==='tib');
+    el('bt-nontib').classList.toggle('selected', batchType==='non_tib');
+    updateSubmitBtn();
+  });
+});
+
+// ── New Job ──
+function showNewJob() {
+  hide('progress-screen'); hide('phase-a-screen');
+  hidePhaseBScreen(); hideReconcileScreen();
+  show('new-job-screen');
+  el('main-area').style.display = '';
+}
+el('new-job-btn').addEventListener('click', showNewJob);
+function updateSubmitBtn() {
+  el('submit-job-btn').disabled = !(batchType && el('wl-input').value.trim() && el('pdf-input').files[0]);
+}
+el('wl-input').addEventListener('input', updateSubmitBtn);
+el('pdf-input').addEventListener('change', updateSubmitBtn);
+el('submit-job-btn').addEventListener('click', async () => {
+  const wlRaw = el('wl-input').value.trim(); const pdf = el('pdf-input').files[0];
+  if (!batchType || !wlRaw || !pdf) return;
+  el('job-error').classList.add('hidden'); el('submit-job-btn').disabled = true;
+  const fd = new FormData();
+  fd.append('whitelist_raw', wlRaw);
+  fd.append('file', pdf);
+  fd.append('batch_type', batchType);
+  try {
+    const r = await fetch('/api/jobs',{method:'POST',body:fd});
+    if (!r.ok) { const t=await r.text(); throw new Error(t.startsWith('<') ? 'Server error' : t); }
+    const d = await r.json(); jobId=d.job_id; totalPages=d.total_pages; whitelist=d.whitelist;
+    hide('new-job-screen'); show('progress-screen'); pollStatus();
+  } catch(e) {
+    el('job-error').textContent='Error: '+e.message; el('job-error').classList.remove('hidden'); el('submit-job-btn').disabled=false;
+  }
+});
+
+// ── Progress ──
+async function pollStatus() {
+  try {
+    const d = await api('GET',`/api/jobs/${jobId}/status`);
+    const pct = totalPages>0 ? Math.round(d.progress_page/totalPages*100) : 0;
+    el('progress-bar').style.width = pct+'%';
+    el('progress-label').textContent = `Page ${d.progress_page} of ${totalPages} \u2014 ${d.status}`;
+    if (d.status==='ready') {
+      reviewState = await api('GET',`/api/jobs/${jobId}/review`);
+      hide('progress-screen'); buildPhaseA();
+    } else if (d.status==='error') {
+      el('progress-label').textContent = 'Error: '+(d.error||'unknown');
+    } else { setTimeout(pollStatus, 1500); }
+  } catch(e) { el('progress-label').textContent='Poll error: '+e.message; setTimeout(pollStatus,3000); }
+}
+
+// ── Phase A ──
+function buildPhaseA() {
+  boundaries = reviewState.blocks.map(b=>b.pages[0]).sort((a,b)=>a-b);
+  if (!boundaries.includes(1)) boundaries.unshift(1);
+  renderPhaseA();
+  show('phase-a-screen');
+}
+
+function pageToBlockIdx(page) {
+  for (let i=boundaries.length-1; i>=0; i--) { if (page>=boundaries[i]) return i; }
+  return 0;
+}
+
+function getOptimisticTicket(page) {
+  if (!reviewState||!reviewState.blocks) return '';
+  for (const b of reviewState.blocks) { if (b.pages.includes(page)) return b.ticket||'?'; }
+  return '';
+}
+
+function renderPhaseA() {
+  const grid = el('thumb-grid'); grid.innerHTML='';
+  for (let p=1; p<=totalPages; p++) {
+    const bi = pageToBlockIdx(p);
+    const color = BLOCK_COLORS[bi%BLOCK_COLORS.length];
+    const cell = document.createElement('div'); cell.className='thumb-cell';
+    const wrap = document.createElement('div'); wrap.className='thumb-img-wrap'; wrap.title=`Page ${p} \u2014 click to enlarge`;
+    const img = document.createElement('img'); img.src=thumbUrl(p); img.loading='lazy';
+    img.addEventListener('click', ()=>openEnlarge(p));
+    wrap.appendChild(img); cell.appendChild(wrap);
+    const band = document.createElement('div'); band.className='block-band'; band.style.background=color; cell.appendChild(band);
+    const num = document.createElement('div'); num.className='thumb-page-num'; num.textContent=`p${p}`; cell.appendChild(num);
+    const lbl = document.createElement('div'); lbl.className='thumb-ticket-label'; lbl.id=`tlbl-${p}`;
+    lbl.textContent=getOptimisticTicket(p)||''; cell.appendChild(lbl);
+    grid.appendChild(cell);
+    if (p<totalPages) {
+      const dz = document.createElement('div');
+      dz.className = 'divider-zone'+(boundaries.includes(p+1)?' has-divider':'');
+      dz.dataset.afterPage = p;
+      const line = document.createElement('div'); line.className='divider-line'; dz.appendChild(line);
+      const btn = document.createElement('div'); btn.className='divider-btn';
+      btn.textContent = boundaries.includes(p+1)?'\u2715':'+';
+      dz.appendChild(btn);
+      dz.addEventListener('click', ()=>toggleDivider(p+1));
+      grid.appendChild(dz);
+    }
+  }
+}
+
+function toggleDivider(startPage) {
+  if (startPage===1) return;
+  const idx=boundaries.indexOf(startPage);
+  if (idx>=0) boundaries.splice(idx,1); else { boundaries.push(startPage); boundaries.sort((a,b)=>a-b); }
+  renderPhaseA(); scheduleRepool();
+}
+
+function scheduleRepool() {
+  if (repoolTimer) clearTimeout(repoolTimer);
+  repoolTimer = setTimeout(doRepool, 400);
+}
+
+async function doRepool() {
+  try {
+    reviewState = await formApi('POST',`/api/jobs/${jobId}/repool`,{b: boundaries.join(',')});
+    for (let p=1; p<=totalPages; p++) {
+      const lbl=document.getElementById(`tlbl-${p}`);
+      if (lbl) lbl.textContent=getOptimisticTicket(p)||'';
+    }
+  } catch(e) { console.warn('Repool error:',e); }
+}
+
+el('confirm-boundaries-btn').addEventListener('click', async () => {
+  const btn = el('confirm-boundaries-btn');
+  btn.disabled = true; btn.textContent = 'Processing\u2026';
+  try {
+    reviewState = await formApi('POST',`/api/jobs/${jobId}/repool`,{b: boundaries.join(',')});
+    hide('phase-a-screen'); enterPhaseB();
+  } catch(e) {
+    alert('Error confirming boundaries: ' + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Confirm Boundaries \u2192';
+  }
+});
+
+// ── Phase B: full-screen confirmation ──
+
+function hidePhaseBScreen() {
+  const s = el('phase-b-screen');
+  s.classList.remove('visible');
+  s.style.display = 'none';
+  el('main-area').style.display = '';
+}
+
+function showPhaseBScreen() {
+  el('main-area').style.display = 'none';
+  const s = el('phase-b-screen');
+  s.style.display = 'flex';
+  s.classList.add('visible');
+}
+
+function hideReconcileScreen() {
+  const s = el('reconcile-screen');
+  s.classList.remove('visible');
+  s.style.display = 'none';
+}
+
+function showReconcileScreen() {
+  hideReconcileScreen();
+  el('main-area').style.display = '';
+  const s = el('reconcile-screen');
+  s.style.display = 'block';
+  s.classList.add('visible');
+}
+
+function enterPhaseB() {
+  pbBlocks = reviewState.blocks.slice();
+  // Preserve existing confirmations/assignments when returning from Phase A
+  // (pbConfirmed and pbAssigned are only reset on a brand-new job)
+  pbCurrentBlock = 0;
+  pbCurrentPageIdx = 0;
+  showPhaseBScreen();
+  renderPhaseBStrip();
+  renderPhaseBBlock();
+}
+
+function pbGetEffectiveTicket(blockIdx) {
+  const b = pbBlocks[blockIdx];
+  return pbAssigned[b.id] !== undefined ? pbAssigned[b.id] : b.ticket;
+}
+
+function pbIsGreen(blockIdx) {
+  const b = pbBlocks[blockIdx];
+  const ticket = pbGetEffectiveTicket(blockIdx);
+  if (!ticket) return false;
+  const hasHard = b.has_hard_flag || (b.flags && b.flags.some(f=>HARD_FLAGS.includes(f)));
+  if (hasHard) return false;
+  if (b.max_confidence < 0.7) return false;
+  return true;
+}
+
+function renderPhaseBStrip() {
+  const strip = el('pb-strip'); strip.innerHTML='';
+  pbBlocks.forEach((b, i) => {
+    const ticket = pbGetEffectiveTicket(i);
+    const isGreen = pbIsGreen(i);
+    const isConfirmed = pbConfirmed[b.id];
+    const color = isGreen ? (isConfirmed ? '#86efac' : '#22c55e') : (isConfirmed ? '#fca5a5' : '#ef4444');
+    const m = document.createElement('div');
+    m.className = 'pb-strip-marker' + (i===pbCurrentBlock?' current':'') + (isConfirmed?' confirmed':'');
+    m.style.background = color;
+    m.title = (ticket||'Unassigned') + ' · pages ' + b.page_range;
+    m.textContent = String(i+1);
+    m.addEventListener('click', ()=>{ pbCurrentBlock=i; pbCurrentPageIdx=0; renderPhaseBBlock(); });
+    strip.appendChild(m);
+  });
+}
+
+function renderPhaseBBlock() {
+  const b = pbBlocks[pbCurrentBlock];
+  const ticket = pbGetEffectiveTicket(pbCurrentBlock);
+  const isGreen = pbIsGreen(pbCurrentBlock);
+  const pages = b.pages;
+  const page = pages[pbCurrentPageIdx];
+
+  // Progress text
+  const confirmedCount = pbBlocks.filter(bl=>pbConfirmed[bl.id]).length;
+  el('pb-progress-text').innerHTML = `<strong>Block ${pbCurrentBlock+1} of ${pbBlocks.length}</strong> &nbsp;·&nbsp; ${confirmedCount} confirmed, ${pbBlocks.length-confirmedCount} remaining`;
+
+  // Page image
+  el('pb-main-img').src = pageUrl(page);
+  el('pb-page-label').textContent = `Page ${page} of ${totalPages} (page ${pbCurrentPageIdx+1}/${pages.length} in block)`;
+  el('pb-page-prev').disabled = pbCurrentPageIdx === 0;
+  el('pb-page-next').disabled = pbCurrentPageIdx === pages.length - 1;
+
+  // Ticket display
+  const tv = el('pb-ticket-value');
+  if (!ticket) {
+    tv.textContent = 'Unassigned';
+    tv.className = 'pb-ticket-value unset';
+  } else {
+    tv.textContent = ticket;
+    tv.className = 'pb-ticket-value ' + (isGreen ? 'green' : 'red');
+  }
+
+  // Source line
+  const sources = b.detection_sources || [];
+  el('pb-source-line').innerHTML = sources.map(s=>`<span class="source-badge ${srcClass(s)}">${s}</span>`).join('') +
+    (b.max_confidence > 0 ? ` <span style="color:var(--soft);font-size:.78rem">conf ${Math.round(b.max_confidence*100)}%</span>` : '');
+
+  // Flags
+  const flagsDiv = el('pb-flags'); flagsDiv.innerHTML='';
+  if (b.flags && b.flags.length > 0) {
+    b.flags.forEach(f=>{
+      const sp=document.createElement('span'); sp.className=`flag-badge ${flagClass(f)}`; sp.textContent=flagLabel(f); flagsDiv.appendChild(sp);
+    });
+  }
+
+  // Identity input — show current ticket
+  const inp = el('pb-identity-input');
+  inp.value = ticket || '';
+  inp.classList.remove('invalid');
+  el('pb-identity-hint').textContent = 'Type to filter whitelist, Enter to commit.';
+  el('pb-identity-hint').classList.remove('error');
+  el('pb-dropdown').classList.remove('open');
+  pbDropdownFocused = -1;
+
+  // Confirm button state
+  const canConfirm = !!ticket;
+  el('pb-confirm-btn').disabled = !canConfirm;
+  el('pb-confirm-btn').textContent = pbConfirmed[b.id] ? 'Re-confirm \u2713' : 'Confirm & Next \u2192';
+
+  // Block navigation
+  el('pb-prev-block-btn').disabled = pbCurrentBlock === 0;
+  el('pb-next-block-btn').disabled = pbCurrentBlock === pbBlocks.length - 1;
+
+  // Strip update
+  renderPhaseBStrip();
+}
+
+// Identity input logic
+el('pb-identity-input').addEventListener('input', () => {
+  const val = el('pb-identity-input').value.trim();
+  pbDropdownFocused = -1;
+  renderDropdown(val);
+});
+
+el('pb-identity-input').addEventListener('keydown', e => {
+  const dd = el('pb-dropdown');
+  const items = dd.querySelectorAll('.pb-dropdown-item');
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    pbDropdownFocused = Math.min(pbDropdownFocused+1, items.length-1);
+    renderDropdownFocus(items);
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    pbDropdownFocused = Math.max(pbDropdownFocused-1, 0);
+    renderDropdownFocus(items);
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    e.stopPropagation();
+    if (pbDropdownFocused >= 0 && items[pbDropdownFocused]) {
+      commitIdentity(items[pbDropdownFocused].dataset.ticket);
+    } else {
+      const val = el('pb-identity-input').value.trim();
+      if (whitelist.includes(val)) {
+        commitIdentity(val);
+      } else if (val) {
+        el('pb-identity-hint').textContent = '\u26a0 "' + val + '" is not in the whitelist. Only whitelist entries can be committed.';
+        el('pb-identity-hint').classList.add('error');
+        el('pb-identity-input').classList.add('invalid');
+      }
+    }
+  } else if (e.key === 'Escape') {
+    dd.classList.remove('open');
+    el('pb-identity-input').blur();
+  }
+});
+
+el('pb-identity-input').addEventListener('blur', () => {
+  // Delay to allow click on dropdown items
+  setTimeout(() => el('pb-dropdown').classList.remove('open'), 150);
+});
+
+function renderDropdown(filter) {
+  const dd = el('pb-dropdown'); dd.innerHTML='';
+  const matches = filter ? whitelist.filter(t=>t.startsWith(filter)||t.includes(filter)) : whitelist;
+  if (matches.length === 0) { dd.classList.remove('open'); return; }
+  matches.forEach((t, i) => {
+    const item = document.createElement('div');
+    item.className = 'pb-dropdown-item';
+    item.dataset.ticket = t;
+    item.textContent = t;
+    item.addEventListener('mousedown', e => { e.preventDefault(); commitIdentity(t); });
+    dd.appendChild(item);
+  });
+  dd.classList.add('open');
+}
+
+function renderDropdownFocus(items) {
+  items.forEach((it,i)=>it.classList.toggle('focused', i===pbDropdownFocused));
+  if (pbDropdownFocused >= 0 && items[pbDropdownFocused]) {
+    items[pbDropdownFocused].scrollIntoView({block:'nearest'});
+  }
+}
+
+async function commitIdentity(ticket) {
+  const b = pbBlocks[pbCurrentBlock];
+  el('pb-dropdown').classList.remove('open');
+  el('pb-identity-input').value = ticket;
+  el('pb-identity-hint').textContent = 'Committing\u2026';
+  el('pb-identity-hint').classList.remove('error');
+  el('pb-identity-input').classList.remove('invalid');
+  try {
+    const newState = await formApi('PATCH', `/api/jobs/${jobId}/review`, {action:'reassign', block_id: b.id, ticket});
+    reviewState = newState;
+    pbBlocks = reviewState.blocks.slice();
+    pbAssigned[b.id] = ticket;
+    el('pb-identity-hint').textContent = '\u2713 Assigned to ' + ticket;
+    renderPhaseBBlock();
+    el('pb-identity-input').blur();
+  } catch(err) {
+    el('pb-identity-hint').textContent = 'Error: ' + err.message;
+    el('pb-identity-hint').classList.add('error');
+  }
+}
+
+function pbConfirmBlock() {
+  const b = pbBlocks[pbCurrentBlock];
+  const ticket = pbGetEffectiveTicket(pbCurrentBlock);
+  if (!ticket) {
+    // Focus identity input instead of advancing
+    el('pb-identity-input').focus();
+    renderDropdown('');
+    return;
+  }
+  pbConfirmed[b.id] = true;
+  const isLast = pbCurrentBlock === pbBlocks.length - 1;
+  if (isLast) {
+    // All done — go to reconciliation
+    hidePhaseBScreen();
+    buildReconcileScreen();
+    return;
+  }
+  pbCurrentBlock++;
+  pbCurrentPageIdx = 0;
+  renderPhaseBBlock();
+}
+
+el('pb-confirm-btn').addEventListener('click', pbConfirmBlock);
+
+el('pb-page-prev').addEventListener('click', () => {
+  if (pbCurrentPageIdx > 0) { pbCurrentPageIdx--; renderPhaseBBlock(); }
+});
+el('pb-page-next').addEventListener('click', () => {
+  if (pbCurrentPageIdx < pbBlocks[pbCurrentBlock].pages.length - 1) { pbCurrentPageIdx++; renderPhaseBBlock(); }
+});
+el('pb-main-img').addEventListener('click', () => openEnlarge(pbBlocks[pbCurrentBlock].pages[pbCurrentPageIdx]));
+
+el('pb-prev-block-btn').addEventListener('click', () => {
+  if (pbCurrentBlock > 0) { pbCurrentBlock--; pbCurrentPageIdx=0; renderPhaseBBlock(); }
+});
+el('pb-next-block-btn').addEventListener('click', () => {
+  if (pbCurrentBlock < pbBlocks.length-1) { pbCurrentBlock++; pbCurrentPageIdx=0; renderPhaseBBlock(); }
+});
+
+el('pb-back-btn').addEventListener('click', () => {
+  hidePhaseBScreen();
+  show('phase-a-screen');
+});
+
+// ── Keyboard navigation for Phase B ──
+document.addEventListener('keydown', e => {
+  // Only active when Phase B screen is visible
+  const pbScreen = el('phase-b-screen');
+  if (!pbScreen.classList.contains('visible')) return;
+
+  // Don't intercept when identity input is focused
+  const inp = el('pb-identity-input');
+  if (document.activeElement === inp) return;
+
+  // Don't intercept when filmstrip/enlarge modal is open
+  if (el('filmstrip-modal').style.display === 'block') return;
+  if (el('enlarge-modal').style.display === 'block') return;
+
+  if (e.key === 'ArrowRight') {
+    e.preventDefault();
+    pbConfirmBlock();
+  } else if (e.key === 'ArrowLeft') {
+    e.preventDefault();
+    if (pbCurrentBlock > 0) { pbCurrentBlock--; pbCurrentPageIdx=0; renderPhaseBBlock(); }
+  } else if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    const b = pbBlocks[pbCurrentBlock];
+    if (pbCurrentPageIdx < b.pages.length - 1) { pbCurrentPageIdx++; renderPhaseBBlock(); }
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (pbCurrentPageIdx > 0) { pbCurrentPageIdx--; renderPhaseBBlock(); }
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    hidePhaseBScreen();
+    show('phase-a-screen');
+  }
+});
+
+// ── Reconciliation screen ──
+
+function buildReconcileScreen() {
+  const blocks = reviewState.blocks;
+  const wl = reviewState.whitelist || whitelist;
+
+  // Apply user overrides to get final ticket assignments
+  const finalBlocks = blocks.map(b => ({
+    ...b,
+    ticket: pbAssigned[b.id] !== undefined ? pbAssigned[b.id] : b.ticket,
+  }));
+
+  // Build ticket → blocks map
+  const ticketToBlocks = {};
+  finalBlocks.forEach(b => {
+    if (!b.ticket) return;
+    if (!ticketToBlocks[b.ticket]) ticketToBlocks[b.ticket] = [];
+    ticketToBlocks[b.ticket].push(b);
+  });
+
+  // Three checks
+  const assignedTickets = new Set(finalBlocks.map(b=>b.ticket).filter(Boolean));
+  const missing = wl.filter(t => !assignedTickets.has(t));
+  const duplicates = wl.filter(t => (ticketToBlocks[t]||[]).length > 1);
+  const extras = finalBlocks.filter(b => b.ticket && !wl.includes(b.ticket));
+  const allConfirmed = finalBlocks.every(b => pbConfirmed[b.id]);
+
+  const checkMissing = missing.length === 0;
+  const checkDupes = duplicates.length === 0;
+  const checkExtras = extras.length === 0;
+  const allPass = checkMissing && checkDupes && checkExtras && allConfirmed;
+
+  // Render checks
+  el('reconcile-checks').innerHTML = `
+    <span class="check-pill ${checkMissing?'pass':'fail'}">${checkMissing?'\u2713 No missing tickets':'\u2717 Missing: '+missing.join(', ')}</span>
+    <span class="check-pill ${checkDupes?'pass':'fail'}">${checkDupes?'\u2713 No duplicates':'\u2717 Duplicates: '+duplicates.join(', ')}</span>
+    <span class="check-pill ${checkExtras?'pass':'fail'}">${checkExtras?'\u2713 No extras':'\u2717 Extra tickets: '+extras.map(b=>b.ticket).join(', ')}</span>
+    <span class="check-pill ${allConfirmed?'pass':'fail'}">${allConfirmed?'\u2713 All blocks confirmed':'\u2717 Unconfirmed blocks remain'}</span>
+  `;
+
+  const confirmedCount = finalBlocks.filter(b=>pbConfirmed[b.id]).length;
+  el('reconcile-title').textContent = allPass ? '\u2713 Batch Complete' : '\u26a0 Batch Incomplete';
+  el('reconcile-headline').textContent =
+    `${wl.length} ticket${wl.length!==1?'s':''} expected \u00b7 ${confirmedCount} block${confirmedCount!==1?'s':''} confirmed \u00b7 ` +
+    (allPass ? 'every ticket matched exactly once \u2713' : 'issues found \u2014 review below');
+
+  // Build table
+  const tbody = el('reconcile-tbody'); tbody.innerHTML='';
+  wl.forEach((t, i) => {
+    const matchedBlocks = ticketToBlocks[t] || [];
+    const isDupe = matchedBlocks.length > 1;
+    const isMissing = matchedBlocks.length === 0;
+    const rowClass = (isDupe || isMissing) ? 'row-fail' : 'row-ok';
+
+    if (matchedBlocks.length === 0) {
+      const tr = document.createElement('tr'); tr.className = rowClass;
+      tr.innerHTML = `
+        <td>${i+1}</td>
+        <td><strong>${t}</strong></td>
+        <td style="color:var(--danger)">No block assigned</td>
+        <td>—</td>
+        <td>—</td>
+        <td><span class="check-pill fail" style="font-size:.72rem">\u2717 Missing</span></td>
+      `;
+      tbody.appendChild(tr);
+    } else {
+      matchedBlocks.forEach((b, bi) => {
+        const tr = document.createElement('tr'); tr.className = rowClass;
+        const firstPage = b.pages[0];
+        const confirmed = pbConfirmed[b.id];
+        tr.innerHTML = `
+          <td>${bi===0?i+1:''}</td>
+          <td>${bi===0?`<strong>${t}</strong>`:''}</td>
+          <td>
+            Block ${b.id+1} (pages ${b.page_range})
+            ${isDupe?'<span class="check-pill fail" style="font-size:.68rem;margin-left:4px">\u2717 Duplicate</span>':''}
+          </td>
+          <td>${b.pages.length} page${b.pages.length!==1?'s':''}</td>
+          <td><img class="reconcile-mini-thumb" src="${thumbUrl(firstPage)}" alt="p${firstPage}" loading="lazy"></td>
+          <td>
+            ${confirmed?'<span class="check-pill pass" style="font-size:.72rem">\u2713 Confirmed</span>':'<button class="btn-outline" style="font-size:.75rem;padding:3px 8px" onclick="jumpToBlock('+b.id+')">Review</button>'}
+          </td>
+        `;
+        tbody.appendChild(tr);
+      });
+    }
+  });
+
+  // Extra blocks (not in whitelist — should not happen but show anyway)
+  extras.forEach(b => {
+    const tr = document.createElement('tr'); tr.className='row-fail';
+    tr.innerHTML = `
+      <td>—</td>
+      <td style="color:var(--danger)">EXTRA: ${b.ticket}</td>
+      <td>Block ${b.id+1}</td>
+      <td>${b.pages.length}</td>
+      <td><img class="reconcile-mini-thumb" src="${thumbUrl(b.pages[0])}" loading="lazy"></td>
+      <td><span class="check-pill fail" style="font-size:.72rem">\u2717 Not in whitelist</span></td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  // Download button
+  el('final-confirm-btn').disabled = !allPass;
+  el('reconcile-status-text').textContent = allPass
+    ? 'All checks pass. Ready to download.'
+    : 'Resolve all issues above before downloading.';
+
+  showReconcileScreen();
+}
+
+function jumpToBlock(blockId) {
+  const idx = pbBlocks.findIndex(b=>b.id===blockId);
+  if (idx < 0) return;
+  pbCurrentBlock = idx; pbCurrentPageIdx = 0;
+  hideReconcileScreen();
+  showPhaseBScreen();
+  renderPhaseBBlock();
+}
+
+el('final-confirm-btn').addEventListener('click', async () => {
+  el('final-confirm-btn').disabled = true;
+  el('final-confirm-btn').innerHTML = '<span class="spinner"></span>Building ZIP\u2026';
+  try {
+    const fd = new FormData();
+    const r = await fetch(`/api/jobs/${jobId}/confirm`, {method:'POST', body: fd});
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(t.startsWith('<') ? 'Server error (unexpected HTML response)' : t);
+    }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href=url;
+    const cd = r.headers.get('Content-Disposition')||'';
+    const m = cd.match(/filename="([^"]+)"/);
+    a.download = m ? m[1] : 'tickets.zip'; a.click();
+    el('final-confirm-btn').textContent = '\u2713 Downloaded';
+    el('reconcile-status-text').textContent = 'ZIP downloaded. Start a new job when ready.';
+  } catch(e) {
+    alert('Download failed: ' + e.message);
+    el('final-confirm-btn').disabled = false;
+    el('final-confirm-btn').textContent = 'Confirm & Download ZIP';
+  }
+});
+
+// ── Filmstrip ──
+function openFilmstrip(pages, startIdx, title) {
+  if (!pages || pages.length === 0) { alert('No pages in this block.'); return; }
+  filmstripPages=pages; filmstripCurrent=startIdx;
+  el('filmstrip-title').textContent=title;
+  const strip=el('filmstrip-strip'); strip.innerHTML='';
+  pages.forEach((p,i)=>{
+    const img=document.createElement('img');
+    img.className='strip-thumb'+(i===startIdx?' active':'');
+    img.src=thumbUrl(p); img.loading='lazy';
+    img.addEventListener('click',()=>showFilmstripPage(i));
+    strip.appendChild(img);
+  });
+  showFilmstripPage(startIdx);
+  el('filmstrip-modal').style.display='block';
+}
+function showFilmstripPage(idx) {
+  filmstripCurrent=idx; const p=filmstripPages[idx];
+  el('filmstrip-img').src=pageUrl(p); el('filmstrip-page-info').textContent=`Page ${p} of ${totalPages}`;
+  el('filmstrip-strip').querySelectorAll('.strip-thumb').forEach((t,i)=>t.classList.toggle('active',i===idx));
+}
+el('filmstrip-prev').addEventListener('click',()=>{if(filmstripCurrent>0)showFilmstripPage(filmstripCurrent-1);});
+el('filmstrip-next').addEventListener('click',()=>{if(filmstripCurrent<filmstripPages.length-1)showFilmstripPage(filmstripCurrent+1);});
+el('filmstrip-close').addEventListener('click',()=>el('filmstrip-modal').style.display='none');
+el('filmstrip-modal').addEventListener('click',e=>{if(e.target===el('filmstrip-modal'))el('filmstrip-modal').style.display='none';});
+
+// ── Enlarge ──
+function openEnlarge(page){el('enlarge-img').src=pageUrl(page);el('enlarge-modal').style.display='block';}
+el('enlarge-modal').addEventListener('click',()=>el('enlarge-modal').style.display='none');
+
+// ── Filmstrip keyboard (only when filmstrip is open) ──
+document.addEventListener('keydown', e => {
+  if (el('filmstrip-modal').style.display==='block') {
+    if(e.key==='ArrowRight'||e.key==='ArrowDown'){e.preventDefault();if(filmstripCurrent<filmstripPages.length-1)showFilmstripPage(filmstripCurrent+1);}
+    else if(e.key==='ArrowLeft'||e.key==='ArrowUp'){e.preventDefault();if(filmstripCurrent>0)showFilmstripPage(filmstripCurrent-1);}
+    else if(e.key==='Escape')el('filmstrip-modal').style.display='none';
+  }
+  if (el('enlarge-modal').style.display==='block' && e.key==='Escape') {
+    el('enlarge-modal').style.display='none';
+  }
+});
+
+checkAuth();
+</script>
+</body>
+</html>

@@ -1,0 +1,57 @@
+name: Build STS-Sender Windows exe
+
+on:
+  push:
+    paths:
+      - 'sender/**'
+    branches:
+      - main
+  workflow_dispatch:   # allow manual trigger from GitHub UI
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install msal requests pyinstaller
+
+      - name: Build single-file exe
+        working-directory: sender
+        run: |
+          pyinstaller `
+            --onefile `
+            --windowed `
+            --name "STS-Sender" `
+            --add-data "sender_core.py;." `
+            sender.py
+
+      - name: Verify exe was created
+        working-directory: sender
+        run: |
+          dir dist\STS-Sender.exe
+          echo "Build successful"
+
+      - name: Upload exe as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: STS-Sender-exe
+          path: sender/dist/STS-Sender.exe
+          retention-days: 90
+
+      - name: Create GitHub Release (on tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: sender/dist/STS-Sender.exe
+          generate_release_notes: true
