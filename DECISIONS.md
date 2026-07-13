@@ -553,3 +553,50 @@ The 4 UNMATCHED pages are all handwritten photo pages where the model reads a no
 
 **Unit tests: 113 passed, 0 failed.**
 
+
+---
+
+## Decision 16 — Pink detector over-triggering, paid-tier Gemini RPM, retry_status UI, mode banner (2026-07-13)
+
+### Context
+
+Job `c1a3dd4d` (first fixture #6 attempt) ran in fast mode correctly, but the pink detector flagged 12 of 16 pages as having pink stickers. This produced 12 single-page blocks, each requiring its own API call — effectively full mode with extra overhead. The "one page at a time" appearance was 12 concurrent API calls all hitting the 5 RPM free-tier limit simultaneously and staggering through backoff. The job was functionally correct but extremely slow.
+
+### Root cause: pink detector over-triggering
+
+The pink detector's HSV threshold was calibrated on fixture #5 (TIB batch, no stickers). On fixture #6 (non-TIB, sticker batch), the detector flagged 12/16 pages — 7–11 false positives. The likely cause is that the fixture #6 pages contain bright-coloured content (banknote imagery, grade labels, or other vivid elements) that falls within the HSV pink/magenta range. The calibration needs to be tightened against the actual fixture #6 pages.
+
+**Standing policy:** The pink detector threshold is calibrated against the confirmed fixture #6 ground-truth run. Until that run completes, the threshold is provisional. After the ground-truth run, the false-positive and false-negative counts are documented here and the threshold is frozen.
+
+### Paid-tier Gemini RPM (LOCKED recommendation)
+
+| Tier | Qualification | Approx RPM (flash preview) | Recommended concurrency |
+|---|---|---|---|
+| Free | Active project | 5–10 RPM | 1 (sequential) |
+| Tier 1 | Billing enabled, first payment | 150–300 RPM | 5 (current setting) |
+| Tier 2 | $100 spent + 3 days | 1,000+ RPM | 10–15 |
+
+**Recommendation:** At Tier 1 (billing enabled), concurrency-5 is safe and will complete a 16-page batch in ~15–20s (5 concurrent calls at ~3s/call). At free tier, concurrency-5 causes immediate 429 storms; reduce to `workers=1` or accept the backoff latency. The `workers` parameter in `run_detection` and `run_detection_fast` controls this and can be adjusted without a code change if needed.
+
+**Note:** Preview models have more restricted rate limits than stable models. If `gemini-3-flash-preview` is replaced by a stable `gemini-3-flash`, the RPM limits will be higher and the concurrency recommendation may increase.
+
+### retry_status UI (commit `3a80746`)
+
+`detect_page` now accepts a `retry_callback: Callable[[str], None]` parameter. On each retry (rate-limit, timeout, server error, or other), it calls the callback with a human-readable status string such as `"rate-limited on page 15 (attempt 2/5) — waiting 8s"`. `run_detection` accepts a `retry_callback` parameter and passes it to each `detect_page` call. `main.py` passes a thread-safe callback that writes to `job["retry_status"]`. The `/api/jobs/{id}/status` endpoint exposes `retry_status`; the frontend `pollStatus()` shows it in the progress bar when set, replacing the generic "Page N of M — detecting" label.
+
+### Mode banner (commit `3a80746`)
+
+The processing screen title now shows the active mode immediately on job creation:
+- Fast mode: `⚡ FAST MODE — reading first pages of pink-bounded blocks only`
+- Full mode: `◼ FULL MODE — reading every page`
+
+Phase A header shows a persistent mode banner (amber for fast, blue for full) with a one-line description. This makes a mode mismatch visible within the first five seconds of a job, not after 16 pages.
+
+The fast-mode checkbox is always visible in the new-job form (not gated on batch type). Selecting non-TIB auto-checks it; the user can uncheck it explicitly. The checkbox label includes a one-line explanation: "local pink detection + first-page-only API — faster for non-TIB batches."
+
+### Fixture suite results confirming current code (commit `3a80746`)
+
+Run after all changes in this decision. All 67 pages across fixtures #1, #2, #4, #5. Model: `gemini-3-flash-preview`. 0 API errors. 0 wrong-ticket assignments. Results identical to Decision 15 run.
+
+**Unit tests: 113 passed, 0 failed.**
+

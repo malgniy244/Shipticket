@@ -63,6 +63,12 @@
   .btn-outline { padding: 8px 18px; background: var(--card); color: var(--primary); border: 1px solid var(--primary); border-radius: 6px; font-size: .9rem; cursor: pointer; }
   .btn-outline:hover { background: #eff6ff; }
 
+  /* Mode banner (processing screen + Phase A) */
+  .mode-banner { font-size: .82rem; font-weight: 700; padding: 6px 14px; border-radius: 5px; width: 100%; }
+  .mode-banner-fast { background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
+  .mode-banner-full { background: #eff6ff; color: #1e40af; border: 1px solid #bfdbfe; }
+  #progress-screen .mode-banner { margin-top: 12px; max-width: 480px; }
+
   /* Thumbnail grid */
   .thumb-grid { display: flex; flex-wrap: wrap; gap: 0; align-items: flex-start; }
   .thumb-cell { display: flex; flex-direction: column; align-items: center; }
@@ -277,6 +283,7 @@
       <div class="phase-header">
         <h2>Phase A &mdash; Boundary Review</h2>
         <div class="phase-desc">Click a gap between pages to add or remove a split divider. Dividers define where one ticket ends and the next begins. Ticket labels update automatically.</div>
+        <div id="phase-a-mode-banner" class="mode-banner hidden"></div>
         <button class="btn-success" id="confirm-boundaries-btn">Confirm Boundaries &rarr;</button>
       </div>
       <div id="thumb-grid" class="thumb-grid"></div>
@@ -499,6 +506,12 @@ el('submit-job-btn').addEventListener('click', async () => {
     const r = await fetch('/api/jobs',{method:'POST',body:fd});
     if (!r.ok) { const t=await r.text(); throw new Error(t.startsWith('<') ? 'Server error' : t); }
     const d = await r.json(); jobId=d.job_id; totalPages=d.total_pages; whitelist=d.whitelist;
+    activeJobFastMode = !!d.fast_mode;
+    // Show active mode loudly in the processing screen title
+    const modeLabel = activeJobFastMode
+      ? '\u26a1 FAST MODE — reading first pages of pink-bounded blocks only'
+      : '\u25a0 FULL MODE — reading every page';
+    el('progress-title').textContent = modeLabel;
     hide('new-job-screen'); show('progress-screen'); pollStatus();
   } catch(e) {
     el('job-error').textContent='Error: '+e.message; el('job-error').classList.remove('hidden'); el('submit-job-btn').disabled=false;
@@ -538,9 +551,20 @@ async function pollStatus() {
 }
 
 // ── Phase A ──
+let activeJobFastMode = false; // set from job creation response or review state
 function buildPhaseA() {
   boundaries = reviewState.blocks.map(b=>b.pages[0]).sort((a,b)=>a-b);
   if (!boundaries.includes(1)) boundaries.unshift(1);
+  // Show mode banner in Phase A header
+  const banner = el('phase-a-mode-banner');
+  if (activeJobFastMode) {
+    banner.textContent = '\u26a1 FAST MODE \u2014 reading first pages of pink-bounded blocks only. Not-read pages inherit from block anchor.';
+    banner.className = 'mode-banner mode-banner-fast';
+  } else {
+    banner.textContent = '\u25a0 FULL MODE \u2014 every page was read by the vision model.';
+    banner.className = 'mode-banner mode-banner-full';
+  }
+  banner.classList.remove('hidden');
   renderPhaseA();
   show('phase-a-screen');
 }

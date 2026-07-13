@@ -193,6 +193,7 @@ def detect_page(
     jpeg_bytes: bytes,
     model: str = DEFAULT_MODEL,
     max_retries: int = 5,
+    retry_callback: Callable[[str], None] | None = None,
 ) -> dict:
     """Send one page image to the vision model and return structured detection result.
 
@@ -273,15 +274,23 @@ def detect_page(
                 # Exponential backoff for rate limits: 4s, 8s, 16s, 32s, 64s
                 wait = (2 ** (attempt + 2))
                 log.warning("Page %d attempt %d rate-limited (429) — retrying in %ds", page_num, attempt + 1, wait)
+                if retry_callback:
+                    retry_callback(f"rate-limited on page {page_num} (attempt {attempt+1}/{max_retries}) — waiting {wait}s")
             elif is_timeout:
                 wait = 2 ** attempt
                 log.warning("Page %d attempt %d timed out (60s) — retrying in %ds", page_num, attempt + 1, wait)
+                if retry_callback:
+                    retry_callback(f"page {page_num} timed out (attempt {attempt+1}/{max_retries}) — retrying in {wait}s")
             elif is_server_error:
                 wait = 2 ** attempt
                 log.warning("Page %d attempt %d server error — retrying in %ds", page_num, attempt + 1, wait)
+                if retry_callback:
+                    retry_callback(f"server error on page {page_num} (attempt {attempt+1}/{max_retries}) — retrying in {wait}s")
             else:
                 wait = 2 ** attempt
                 log.warning("Page %d attempt %d failed: %s — retrying in %ds", page_num, attempt + 1, exc, wait)
+                if retry_callback:
+                    retry_callback(f"page {page_num} error (attempt {attempt+1}/{max_retries}) — retrying in {wait}s")
             time.sleep(wait)
 
     log.error("Page %d: all %d retries exhausted. Last error: %s", page_num, max_retries, last_exc_str)
@@ -489,6 +498,7 @@ def run_detection(
     dpi: int = 150,
     force_pages: list[int] | None = None,
     whitelist: list[str] | None = None,
+    retry_callback: Callable[[str], None] | None = None,
 ) -> list[dict]:
     """
     Run detection on all pages of a PDF.
@@ -540,7 +550,11 @@ def run_detection(
     # ── First-pass: concurrent detection ──────────────────────────────────────
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(detect_page, client, pn, page_images[pn], model): pn
+            executor.submit(
+                detect_page, client, pn, page_images[pn], model,
+                5,  # max_retries
+                retry_callback,
+            ): pn
             for pn in pending
         }
         for future in as_completed(futures):

@@ -263,11 +263,17 @@ def run_detection_background(job_id: str):
             log.info("Job %s: fast mode metrics: %s", job_id, fast_metrics)
         else:
             # Full mode: run detection on all pages
+            def _set_retry_status(msg: str):
+                with jobs_lock:
+                    if jobs.get(job_id):
+                        jobs[job_id]["retry_status"] = msg
+
             detection_results = run_detection(
                 pdf_path=pdf_path,
                 checkpoint_path=checkpoint_path,
                 workers=5,
                 whitelist=whitelist,
+                retry_callback=_set_retry_status,
             )
 
         with jobs_lock:
