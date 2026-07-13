@@ -146,6 +146,8 @@ def make_job(job_id: str, whitelist: list[str], pdf_path: str, total_pages: int,
         "last_heartbeat": None,      # epoch float updated each time a page completes
         "pre_boundaries": None,      # pink boundary pages (fast mode only)
         "fast_mode_not_read": 0,     # count of not_read pages (fast mode only)
+        # Activity log: last 100 entries, each {ts, msg}
+        "log_lines": [],
     }
 
 
@@ -184,6 +186,22 @@ def persist_job(job_id: str):
         log.warning("Job %s: failed to persist state: %s", job_id, exc)
 
 
+def job_log(job_id: str, msg: str, max_lines: int = 100):
+    """Append a timestamped log entry to the job's activity log ring buffer.
+    
+    Thread-safe. Trims to max_lines. Does NOT call persist_job (too frequent);
+    the log is persisted lazily on the next regular persist_job call.
+    """
+    entry = {"ts": datetime.utcnow().strftime("%H:%M:%S"), "msg": msg}
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if job is not None:
+            lines = job.setdefault("log_lines", [])
+            lines.append(entry)
+            if len(lines) > max_lines:
+                job["log_lines"] = lines[-max_lines:]
+
+
 def cleanup_job(job_id: str):
     """Delete all files for a job and remove from jobs dict."""
     with jobs_lock:
@@ -217,6 +235,7 @@ def run_detection_background(job_id: str):
         with jobs_lock:
             job["status"] = "detecting"
         persist_job(job_id)
+        job_log(job_id, f"Job started — {total_pages if False else job.get('total_pages','?')} pages, {'fast' if job.get('fast_mode') else 'full'} mode")
 
         pdf_path = job["pdf_path"]
         whitelist = job["whitelist"]
@@ -281,6 +300,10 @@ def run_detection_background(job_id: str):
             # pre_boundaries: 1-indexed page numbers where pink sticker detected
             pre_boundaries = [i + 1 for i, flag in enumerate(pink_flags) if flag]
             log.info("Job %s: pink boundaries detected on pages %s", job_id, pre_boundaries)
+            if pre_boundaries:
+                job_log(job_id, f"Pink stickers found on {len(pre_boundaries)} page(s): {pre_boundaries}")
+            else:
+                job_log(job_id, "No pink stickers detected — will read all pages")
             with jobs_lock:
                 if jobs.get(job_id):
                     jobs[job_id]["pink_diagnostics"] = pink_debug_results
@@ -303,6 +326,10 @@ def run_detection_background(job_id: str):
                 if jobs.get(job_id):
                     jobs[job_id]["fast_mode_metrics"] = fast_metrics
             persist_job(job_id)
+            api_total = fast_metrics.get('api_calls_total', '?')
+            wall = fast_metrics.get('wall_clock_seconds', '?')
+            not_read = fast_metrics.get('not_read_count', '?')
+            job_log(job_id, f"Detection complete — {api_total} API calls, {not_read} pages skipped, {wall:.1f}s" if isinstance(wall, float) else f"Detection complete — {api_total} API calls, {not_read} pages skipped")
             log.info("Job %s: fast mode metrics: %s", job_id, fast_metrics)
         else:
             # Full mode: run detection on all pages
@@ -324,6 +351,7 @@ def run_detection_background(job_id: str):
             job["progress_page"] = total_pages
             job["status"] = "grouping"
         persist_job(job_id)
+        job_log(job_id, "Grouping pages into blocks…")
 
         # Run grouping
         # In fast mode, pass the pink-sticker boundaries as forced block starts
@@ -349,13 +377,17 @@ def run_detection_background(job_id: str):
             job["status"] = "ready"
         persist_job(job_id)
 
-        log.info("Job %s: detection+grouping complete, %d blocks", job_id, len(review_state["blocks"]))
+        n_blocks = len(review_state["blocks"])
+        missing = review_state.get("missing_tickets", [])
+        job_log(job_id, f"Ready — {n_blocks} block(s) found" + (f", {len(missing)} ticket(s) missing" if missing else ", all tickets matched"))
+        log.info("Job %s: detection+grouping complete, %d blocks", job_id, n_blocks)
 
         # Generate thumbnails in background (after detection closes its doc)
         generate_thumbnails(job_id, pdf_path, job["thumbnail_dir"])
 
     except Exception as exc:
         log.exception("Job %s failed: %s", job_id, exc)
+        job_log(job_id, f"Error: {exc}")
         with jobs_lock:
             if jobs.get(job_id):
                 jobs[job_id]["status"] = "error"
@@ -588,6 +620,7 @@ async def job_status(job_id: str, _=Depends(require_session)):
         "retry_status": job.get("retry_status"),       # e.g. "retrying page 15 (attempt 2/5)"
         "last_heartbeat": job.get("last_heartbeat"),   # epoch float; None if not started yet
         "fast_mode": job.get("fast_mode", False),
+        "log_lines": job.get("log_lines", []),         # activity log ring buffer
     }
 
 

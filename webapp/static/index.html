@@ -277,6 +277,11 @@
         </div>
         <div class="progress-label" id="progress-label">Starting&#8230;</div>
       </div>
+      <div class="card" style="margin-top:1rem;">
+        <div style="font-size:0.78rem;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.5rem;">Activity Log</div>
+        <div id="activity-log" style="font-family:monospace;font-size:0.82rem;line-height:1.6;max-height:260px;overflow-y:auto;color:#334155;"></div>
+        <div id="activity-log-empty" style="font-size:0.82rem;color:#94a3b8;font-style:italic;">Waiting for job to start&#8230;</div>
+      </div>
     </div>
 
     <div id="phase-a-screen" class="hidden">
@@ -439,7 +444,7 @@ async function api(method, path, body) {
   if (body) { opts.body = JSON.stringify(body); opts.headers['Content-Type']='application/json'; }
   const r = await fetch(path, opts);
   if (r.status === 401) { alert('Session expired \u2014 please log in again.'); location.reload(); throw new Error('Session expired'); }
-  if (!r.ok) { const t = await r.text(); throw new Error(t.startsWith('<') ? 'Server error (unexpected HTML response)' : t); }
+  if (!r.ok) { const t = await r.text(); throw new Error(r.status === 404 ? '404: ' + (t.startsWith('<') ? 'Not found' : t) : t.startsWith('<') ? 'Server error (unexpected HTML response)' : t); }
   return r.json();
 }
 
@@ -541,13 +546,35 @@ async function pollStatus() {
       }
     }
     el('progress-label').textContent = label;
+    // Update activity log panel
+    const logLines = d.log_lines || [];
+    const logEl = el('activity-log');
+    const logEmpty = el('activity-log-empty');
+    if (logLines.length > 0) {
+      logEmpty.style.display = 'none';
+      logEl.innerHTML = logLines.map(l =>
+        `<div><span style="color:#94a3b8;margin-right:.5em;">${l.ts}</span>${l.msg.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>`
+      ).join('');
+      // Auto-scroll to bottom
+      logEl.scrollTop = logEl.scrollHeight;
+    } else {
+      logEmpty.style.display = '';
+    }
     if (d.status==='ready') {
       reviewState = await api('GET',`/api/jobs/${jobId}/review`);
       hide('progress-screen'); buildPhaseA();
     } else if (d.status==='error') {
       el('progress-label').textContent = 'Error: '+(d.error||'unknown');
     } else { setTimeout(pollStatus, 1500); }
-  } catch(e) { el('progress-label').textContent='Poll error: '+e.message; setTimeout(pollStatus,3000); }
+  } catch(e) {
+    // A 404 here means the service restarted and the job is gone from memory.
+    // Show a clear message rather than the raw HTML-response error.
+    const msg = e.message.includes('404') || e.message.toLowerCase().includes('not found')
+      ? 'Job not found — the service restarted during detection. Please re-submit the batch.'
+      : 'Poll error: ' + e.message;
+    el('progress-label').textContent = msg;
+    setTimeout(pollStatus, 3000);
+  }
 }
 
 // ── Phase A ──
