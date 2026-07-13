@@ -16,4 +16,10 @@ services:
         sync: false   # set manually in Render dashboard
       - key: SESSION_SECRET
         generateValue: true
+      - key: STS_DATA_DIR
+        value: /data/sts_jobs  # persistent disk mount path (Decision 17)
     healthCheckPath: /api/me
+    disk:
+      name: sts-data
+      mountPath: /data
+      sizeGB: 1

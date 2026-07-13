@@ -67,6 +67,11 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "changeme")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", secrets.token_hex(32))
 JOB_TTL_SECONDS = 24 * 3600  # 24 hours
 
+# Job data root: persistent disk on Render (/data/sts_jobs), tmpfs locally.
+# Set STS_DATA_DIR env var to override. Decision 17.
+_default_data_dir = str(Path(tempfile.gettempdir()) / "sts_jobs")
+JOBS_ROOT = Path(os.environ.get("STS_DATA_DIR", _default_data_dir))
+
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(title="Ship Ticket Splitter")
 
@@ -144,6 +149,41 @@ def make_job(job_id: str, whitelist: list[str], pdf_path: str, total_pages: int,
     }
 
 
+# ── Job state persistence ────────────────────────────────────────────────────
+
+# Fields that are large/transient and not needed across restarts.
+# detection_results can be large (list of per-page dicts); we persist it because
+# it is required for repool_job after a restart. All other fields are small.
+_NON_SERIALISABLE_FIELDS: set[str] = set()  # nothing excluded — all fields are JSON-safe
+
+
+def _state_path(job_id: str) -> Path:
+    return JOBS_ROOT / job_id / "state.json"
+
+
+def persist_job(job_id: str):
+    """Write the job dict to {job_dir}/state.json atomically.
+    
+    Called after every mutation so a restart can reload from disk.
+    Safe to call with jobs_lock held (does file I/O outside the lock).
+    """
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job:
+        return
+    # Shallow copy to avoid holding the lock during I/O
+    snapshot = dict(job)
+    state_file = _state_path(job_id)
+    tmp_file = state_file.with_suffix(".tmp")
+    try:
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp_file, "w") as f:
+            json.dump(snapshot, f)
+        tmp_file.rename(state_file)
+    except Exception as exc:
+        log.warning("Job %s: failed to persist state: %s", job_id, exc)
+
+
 def cleanup_job(job_id: str):
     """Delete all files for a job and remove from jobs dict."""
     with jobs_lock:
@@ -176,6 +216,7 @@ def run_detection_background(job_id: str):
     try:
         with jobs_lock:
             job["status"] = "detecting"
+        persist_job(job_id)
 
         pdf_path = job["pdf_path"]
         whitelist = job["whitelist"]
@@ -244,6 +285,7 @@ def run_detection_background(job_id: str):
                 if jobs.get(job_id):
                     jobs[job_id]["pink_diagnostics"] = pink_debug_results
                     jobs[job_id]["pre_boundaries"] = pre_boundaries
+            persist_job(job_id)
             def _set_not_read_count(count: int):
                 with jobs_lock:
                     if jobs.get(job_id):
@@ -260,6 +302,7 @@ def run_detection_background(job_id: str):
             with jobs_lock:
                 if jobs.get(job_id):
                     jobs[job_id]["fast_mode_metrics"] = fast_metrics
+            persist_job(job_id)
             log.info("Job %s: fast mode metrics: %s", job_id, fast_metrics)
         else:
             # Full mode: run detection on all pages
@@ -280,6 +323,7 @@ def run_detection_background(job_id: str):
             job["detection_results"] = detection_results
             job["progress_page"] = total_pages
             job["status"] = "grouping"
+        persist_job(job_id)
 
         # Run grouping
         # In fast mode, pass the pink-sticker boundaries as forced block starts
@@ -303,6 +347,7 @@ def run_detection_background(job_id: str):
             }
             job["review_state"] = review_state
             job["status"] = "ready"
+        persist_job(job_id)
 
         log.info("Job %s: detection+grouping complete, %d blocks", job_id, len(review_state["blocks"]))
 
@@ -315,6 +360,7 @@ def run_detection_background(job_id: str):
             if jobs.get(job_id):
                 jobs[job_id]["status"] = "error"
                 jobs[job_id]["error"] = str(exc)
+        persist_job(job_id)
 
 
 def build_review_state(
@@ -493,9 +539,9 @@ async def create_job(
     if not whitelist:
         raise HTTPException(status_code=422, detail="Whitelist is empty")
 
-    # Save uploaded PDF to a temp directory
+    # Save uploaded PDF to the persistent job directory
     job_id = str(uuid.uuid4())
-    job_dir = Path(tempfile.gettempdir()) / "sts_jobs" / job_id
+    job_dir = JOBS_ROOT / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = str(job_dir / "input.pdf")
 
@@ -517,6 +563,7 @@ async def create_job(
     job = make_job(job_id, whitelist, pdf_path, total_pages, batch_type=batch_type, fast_mode=fast_mode_bool)
     with jobs_lock:
         jobs[job_id] = job
+    persist_job(job_id)  # write initial state to disk immediately
 
     # Schedule cleanup after 24h
     schedule_cleanup(job_id, JOB_TTL_SECONDS)
@@ -696,6 +743,7 @@ async def update_review(
     wl = review.get("whitelist", [])
     assigned = {b["ticket"] for b in review["blocks"] if b["ticket"]}
     review["missing_tickets"] = [t for t in wl if t not in assigned]
+    persist_job(job_id)
     return review
 
 
@@ -840,6 +888,7 @@ async def repool_job(job_id: str, boundaries_str: str = Form(..., alias="b"), _=
                 "unmatched_values": grouping_result.unmatched_values,
                 "total_pages": grouping_result.total_pages,
             }
+    persist_job(job_id)
 
     return review_state
 
@@ -934,6 +983,7 @@ async def confirm_job(job_id: str, _=Depends(require_session)):
         job["zip_path"] = zip_path
         job["status"] = "confirmed"
         job["confirmed_snapshot"] = confirmed_snapshot
+    persist_job(job_id)
 
     # Schedule cleanup after download (give 10 minutes to download)
     schedule_cleanup(job_id, delay=600)
@@ -1029,12 +1079,52 @@ app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 @app.on_event("startup")
 async def startup():
-    log.info("Ship Ticket Splitter starting up")
-    # Clean up any stale job dirs from previous runs
-    stale_dir = Path(tempfile.gettempdir()) / "sts_jobs"
-    if stale_dir.exists():
-        shutil.rmtree(stale_dir, ignore_errors=True)
-    stale_dir.mkdir(parents=True, exist_ok=True)
+    log.info("Ship Ticket Splitter starting up — JOBS_ROOT=%s", JOBS_ROOT)
+    JOBS_ROOT.mkdir(parents=True, exist_ok=True)
+
+    # Reload persisted jobs from disk.
+    # Skip jobs that have expired (created_at + JOB_TTL_SECONDS < now).
+    # Skip jobs whose PDF is missing (file was deleted externally).
+    # Jobs that were mid-detection when the service restarted are set to
+    # status='error' with a message so the user knows to re-submit.
+    now = time.time()
+    reloaded = 0
+    expired = 0
+    for state_file in JOBS_ROOT.glob("*/state.json"):
+        try:
+            with open(state_file) as f:
+                job = json.load(f)
+            job_id = job.get("id")
+            if not job_id:
+                continue
+            # Expire check
+            created_at = job.get("created_at", 0)
+            if now - created_at > JOB_TTL_SECONDS:
+                log.info("Startup: expiring old job %s", job_id)
+                shutil.rmtree(state_file.parent, ignore_errors=True)
+                expired += 1
+                continue
+            # PDF existence check
+            if not Path(job.get("pdf_path", "")).exists():
+                log.warning("Startup: job %s PDF missing, skipping", job_id)
+                continue
+            # Jobs that were mid-detection are unrecoverable — mark error
+            if job.get("status") in ("queued", "detecting", "grouping"):
+                job["status"] = "error"
+                job["error"] = "Service restarted during detection — please re-submit this job."
+                # Persist the updated error state
+                tmp = state_file.with_suffix(".tmp")
+                with open(tmp, "w") as f:
+                    json.dump(job, f)
+                tmp.rename(state_file)
+            with jobs_lock:
+                jobs[job_id] = job
+            reloaded += 1
+            log.info("Startup: reloaded job %s (status=%s)", job_id, job.get("status"))
+        except Exception as exc:
+            log.warning("Startup: failed to reload %s: %s", state_file, exc)
+
+    log.info("Startup complete: %d jobs reloaded, %d expired", reloaded, expired)
 
 
 if __name__ == "__main__":

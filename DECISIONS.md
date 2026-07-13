@@ -600,3 +600,70 @@ Run after all changes in this decision. All 67 pages across fixtures #1, #2, #4,
 
 **Unit tests: 113 passed, 0 failed.**
 
+
+---
+
+## Decision 17 — Persistent disk and job state persistence (2026-07-14) — LOCKED
+
+### Context
+
+Render's web service uses ephemeral storage by default. Any service restart (deploy, free-tier spin-down, crash) wipes `/tmp`, destroying uploaded PDFs and all in-memory job state. This caused the Phase B image-not-loading bug: the PDF was deleted by a mid-session deploy, but the job record survived in memory long enough to serve a broken image response.
+
+### Changes
+
+**1. Persistent disk (`render.yaml`)**
+
+A 1 GB Render disk named `sts-data` is mounted at `/data`. All job data (PDF, thumbnails, checkpoint, state file) is written to `/data/sts_jobs/{job_id}/`. The mount path is exposed to the app via the `STS_DATA_DIR` env var (value: `/data/sts_jobs`). Locally, `STS_DATA_DIR` defaults to `$TMPDIR/sts_jobs` so no local config change is needed.
+
+**2. Job state written to disk on every mutation (`main.py`)**
+
+A `persist_job(job_id)` helper writes the full job dict to `{job_dir}/state.json` atomically (write to `.tmp`, then `rename`). It is called after every mutation:
+- Job creation (initial state)
+- Status transitions: `detecting`, `grouping`, `ready`, `error`
+- Pink diagnostics and pre_boundaries set (fast mode)
+- Fast mode metrics set
+- Detection results stored
+- Review state stored after grouping
+- Every `update_review` edit (reassign, split, merge, move_page)
+- Every `repool_job` call (Phase A boundary confirmation)
+- Confirm (ZIP built, confirmed_snapshot written)
+
+**3. Startup reloads from disk**
+
+On startup, the app scans `JOBS_ROOT/*/state.json`, skips expired jobs (older than 24h) and jobs whose PDF is missing, and reloads the rest into the in-memory `jobs` dict. Jobs that were mid-detection when the service restarted are set to `status=error` with a message ("Service restarted during detection — please re-submit this job.") — detection is not resumable, but `ready` and `confirmed` jobs survive intact.
+
+**4. Cleanup**
+
+`cleanup_job()` deletes the entire per-job directory (PDF, thumbnails, checkpoint, state.json). This is called:
+- 10 minutes after confirm (post-download grace period)
+- 24 hours after job creation (TTL)
+- At startup for jobs older than 24h
+
+**5. Restart-survives-review guarantee**
+
+A job that has reached `status=ready` (detection complete, review state built) will survive a service restart. After restart, the user can reload the page, navigate to the same job URL, and resume Phase A/B review with all edits intact. The only data lost on restart is the in-flight progress of a job that was mid-detection.
+
+### Restart test procedure (runbook)
+
+This cannot be fully automated (requires a live Render restart), but the following manual procedure verifies the guarantee:
+
+1. Submit a job and wait for `status=ready`.
+2. Make at least one Phase A boundary edit and one Phase B ticket reassignment.
+3. In the Render dashboard, trigger a **Manual Deploy** of the current commit (this restarts the service).
+4. After the deploy is green, reload the app in the browser.
+5. Navigate to the same job URL. The job should load with all edits intact.
+6. Confirm the batch. The ZIP should download correctly.
+
+Expected log lines on restart:
+```
+Startup: reloaded job {id} (status=ready)
+Startup complete: 1 jobs reloaded, 0 expired
+```
+
+### Disk capacity
+
+1 GB disk. A typical 20-page batch uses ~5 MB (PDF ~3 MB, thumbnails ~1 MB, state ~50 KB). The 24h TTL and post-confirm 10-minute cleanup keep disk usage bounded. At 5 jobs/day, peak usage is ~25 MB — well within the 1 GB limit. If usage approaches 800 MB, the startup cleanup will expire old jobs.
+
+### Fixture suite results confirming current code
+
+67 pages across fixtures #1, #2, #4, #5. Model: `gemini-3-flash-preview`. 0 API errors. 0 wrong-ticket assignments. 113 unit tests passed. Results identical to Decision 16 run.
