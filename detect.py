@@ -237,6 +237,7 @@ def detect_page(
                         "schema": PAGE_RESULT_SCHEMA,
                     },
                 },
+                timeout=60,  # hard per-call timeout — prevents indefinite hang
                 **_max_tokens_kwarg(model, 4096),
             )
             raw = resp.choices[0].message.content
@@ -267,10 +268,14 @@ def detect_page(
             exc_str_lower = last_exc_str.lower()
             is_rate_limit = "429" in last_exc_str or "rate limit" in exc_str_lower or "rate_limit" in exc_str_lower
             is_server_error = any(code in last_exc_str for code in ("500", "502", "503", "504"))
+            is_timeout = "timeout" in exc_str_lower or "timed out" in exc_str_lower
             if is_rate_limit:
-                # Exponential backoff with jitter for rate limits: 4s, 8s, 16s, 32s, 64s
+                # Exponential backoff for rate limits: 4s, 8s, 16s, 32s, 64s
                 wait = (2 ** (attempt + 2))
                 log.warning("Page %d attempt %d rate-limited (429) — retrying in %ds", page_num, attempt + 1, wait)
+            elif is_timeout:
+                wait = 2 ** attempt
+                log.warning("Page %d attempt %d timed out (60s) — retrying in %ds", page_num, attempt + 1, wait)
             elif is_server_error:
                 wait = 2 ** attempt
                 log.warning("Page %d attempt %d server error — retrying in %ds", page_num, attempt + 1, wait)
@@ -350,6 +355,7 @@ def detect_page_second_pass(
                         "schema": SECOND_PASS_SCHEMA,
                     },
                 },
+                timeout=60,  # hard per-call timeout
                 **_max_tokens_kwarg(model, 1024),
             )
             raw = resp.choices[0].message.content
@@ -444,6 +450,7 @@ def detect_page_sticker_retry(
                         "schema": PAGE_RESULT_SCHEMA,
                     },
                 },
+                timeout=60,  # hard per-call timeout
                 **_max_tokens_kwarg(model, 2048),
             )
             raw = resp.choices[0].message.content

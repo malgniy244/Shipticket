@@ -136,6 +136,11 @@ def make_job(job_id: str, whitelist: list[str], pdf_path: str, total_pages: int,
         "pink_diagnostics": None,    # list of per-page pink detector debug dicts (fast mode only)
         "fast_mode_metrics": None,   # dict of fast-mode API call counts and wall clock
         "confirmed_snapshot": None,  # frozen page→ticket map written at confirm time
+        # Live retry/hang status (updated by detect_page callbacks)
+        "retry_status": None,        # e.g. "retrying page 15 (attempt 2/5)"
+        "last_heartbeat": None,      # epoch float updated each time a page completes
+        "pre_boundaries": None,      # pink boundary pages (fast mode only)
+        "fast_mode_not_read": 0,     # count of not_read pages (fast mode only)
     }
 
 
@@ -183,7 +188,10 @@ def run_detection_background(job_id: str):
         # In fast mode, not_read pages are never written to the checkpoint.
         # fast_mode_not_read is set on the job before API calls start so the
         # watcher can add it to the checkpoint count for an accurate display.
+        # last_heartbeat is updated every time a checkpoint entry is written;
+        # if it hasn't advanced for >90s the frontend shows a stale warning.
         def progress_watcher():
+            last_checkpoint_count = 0
             while True:
                 with jobs_lock:
                     j = jobs.get(job_id)
@@ -192,17 +200,27 @@ def run_detection_background(job_id: str):
                 if Path(checkpoint_path).exists():
                     try:
                         with open(checkpoint_path) as f:
-                            checkpoint_entries = len(json.load(f))
+                            entries = json.load(f)
+                        checkpoint_entries = len(entries)
                         with jobs_lock:
                             if jobs.get(job_id):
                                 not_read_count = jobs[job_id].get("fast_mode_not_read", 0)
                                 jobs[job_id]["progress_page"] = checkpoint_entries + not_read_count
+                                # Update heartbeat whenever a new page completes
+                                if checkpoint_entries > last_checkpoint_count:
+                                    jobs[job_id]["last_heartbeat"] = time.time()
+                                    jobs[job_id]["retry_status"] = None  # clear any stale retry msg
+                                    last_checkpoint_count = checkpoint_entries
                     except Exception:
                         pass
                 time.sleep(1)
 
         watcher = threading.Thread(target=progress_watcher, daemon=True)
         watcher.start()
+        # Set initial heartbeat so the frontend can detect a hang from the start
+        with jobs_lock:
+            if jobs.get(job_id):
+                jobs[job_id]["last_heartbeat"] = time.time()
 
         if fast_mode:
             # Fast mode: local pink detection for boundaries, then lazy identification
@@ -514,6 +532,9 @@ async def job_status(job_id: str, _=Depends(require_session)):
         "progress_page": job["progress_page"],
         "total_pages": job["total_pages"],
         "error": job["error"],
+        "retry_status": job.get("retry_status"),       # e.g. "retrying page 15 (attempt 2/5)"
+        "last_heartbeat": job.get("last_heartbeat"),   # epoch float; None if not started yet
+        "fast_mode": job.get("fast_mode", False),
     }
 
 

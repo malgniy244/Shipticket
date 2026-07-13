@@ -511,9 +511,23 @@ async function pollStatus() {
     const d = await api('GET',`/api/jobs/${jobId}/status`);
     const pct = totalPages>0 ? Math.round(d.progress_page/totalPages*100) : 0;
     el('progress-bar').style.width = pct+'%';
-    // In fast mode the bar may show 0 briefly while pink detection runs (no API calls yet)
-    const fastNote = (d.progress_page === 0 && d.status === 'detecting') ? ' (running local pink detection…)' : '';
-    el('progress-label').textContent = `Page ${d.progress_page} of ${totalPages} \u2014 ${d.status}${fastNote}`;
+    // Build label: prefer retry_status if set; otherwise show page count with fast-mode note
+    let label;
+    if (d.retry_status) {
+      label = d.retry_status;
+    } else if (d.progress_page === 0 && d.status === 'detecting' && d.fast_mode) {
+      label = 'Scanning for pink stickers\u2026';
+    } else {
+      label = `Page ${d.progress_page} of ${totalPages} \u2014 ${d.status}`;
+    }
+    // Stale-job warning: if heartbeat hasn't advanced in >90s during detection, warn
+    if (d.status === 'detecting' && d.last_heartbeat) {
+      const staleSecs = Math.floor(Date.now()/1000 - d.last_heartbeat);
+      if (staleSecs > 90) {
+        label += ` (no progress for ${staleSecs}s \u2014 may be retrying or stalled)`;
+      }
+    }
+    el('progress-label').textContent = label;
     if (d.status==='ready') {
       reviewState = await api('GET',`/api/jobs/${jobId}/review`);
       hide('progress-screen'); buildPhaseA();
