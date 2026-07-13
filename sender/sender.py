@@ -29,10 +29,11 @@ class SenderApp(tk.Tk):
         self.resizable(True, True)
         self.configure(bg="#f4f5f7")
 
-        self._folder: Path | None = None
+        self._folder: Path | None = None   # used for sent.log location
         self._pdfs: list[Path] = []
         self._token: str | None = None
         self._running = False
+        self._mode: str = "folder"  # "folder" or "files"
 
         self._build_ui()
 
@@ -47,17 +48,18 @@ class SenderApp(tk.Tk):
         tk.Label(hdr, text=f"→ {TO_EMAIL}  |  Subject: {SUBJECT}",
                  font=("Segoe UI", 10), bg="#1e3a5f", fg="#93c5fd").pack(side="left")
 
-        # ── Folder picker ──
+        # ── Picker row ──
         folder_frame = tk.Frame(self, bg="#f4f5f7", pady=10, padx=16)
         folder_frame.pack(fill="x")
-        tk.Label(folder_frame, text="PDF Folder:", font=("Segoe UI", 10, "bold"),
-                 bg="#f4f5f7").pack(side="left")
-        self._folder_var = tk.StringVar(value="(no folder selected)")
+        self._folder_var = tk.StringVar(value="(nothing selected)")
         tk.Label(folder_frame, textvariable=self._folder_var, font=("Segoe UI", 10),
-                 bg="#f4f5f7", fg="#374151", width=55, anchor="w").pack(side="left", padx=8)
-        tk.Button(folder_frame, text="Browse…", command=self._pick_folder,
+                 bg="#f4f5f7", fg="#374151", width=52, anchor="w").pack(side="left", padx=(0, 8))
+        tk.Button(folder_frame, text="Select Folder…", command=self._pick_folder,
                   font=("Segoe UI", 9), bg="#e5e7eb", relief="flat",
                   padx=10, pady=4, cursor="hand2").pack(side="left")
+        tk.Button(folder_frame, text="Select Files…", command=self._pick_files,
+                  font=("Segoe UI", 9), bg="#e5e7eb", relief="flat",
+                  padx=10, pady=4, cursor="hand2").pack(side="left", padx=(6, 0))
 
         # ── File list ──
         list_frame = tk.Frame(self, bg="#f4f5f7", padx=16)
@@ -171,15 +173,61 @@ class SenderApp(tk.Tk):
                                    cursor="hand2", state="disabled")
         self._stop_btn.pack(side="left")
 
-    # ── Folder picker ────────────────────────────────────────────────────────
+    # ── Pickers ──────────────────────────────────────────────────────────────
 
     def _pick_folder(self):
         folder = filedialog.askdirectory(title="Select folder containing PDFs")
         if not folder:
             return
+        self._mode = "folder"
         self._folder = Path(folder)
         self._folder_var.set(str(self._folder))
         self._scan_folder()
+
+    def _pick_files(self):
+        files = filedialog.askopenfilenames(
+            title="Select PDF file(s) to send",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")]
+        )
+        if not files:
+            return
+        self._mode = "files"
+        paths = [Path(f) for f in files]
+        # Use the parent of the first file as the sent.log location
+        self._folder = paths[0].parent
+        self._folder_var.set(
+            f"{len(paths)} file(s) selected from {self._folder}"
+        )
+        self._load_explicit_files(paths)
+
+    def _load_explicit_files(self, paths: list):
+        sent = load_sent_log(self._folder)
+        matching = [p for p in paths if PDF_PATTERN.match(p.name)]
+        non_matching = [p for p in paths if not PDF_PATTERN.match(p.name)]
+
+        self._pdfs = matching
+        self._listbox.delete(0, "end")
+
+        for p in matching:
+            tag = " ✓ sent" if p.name in sent else ""
+            self._listbox.insert("end", f"  {p.name}{tag}")
+            if p.name in sent:
+                idx = self._listbox.size() - 1
+                self._listbox.itemconfig(idx, fg="#9ca3af")
+
+        for p in non_matching:
+            self._listbox.insert("end", f"  [skip — name doesn't match ticket pattern] {p.name}")
+            idx = self._listbox.size() - 1
+            self._listbox.itemconfig(idx, fg="#d1d5db")
+
+        unsent = [p for p in matching if p.name not in sent]
+        self._log_msg(f"Selected {len(matching)} matching PDF(s), "
+                      f"{len(sent & {p.name for p in matching})} already sent, "
+                      f"{len(unsent)} to send.")
+        if non_matching:
+            self._log_msg(f"Skipping {len(non_matching)} file(s) whose names "
+                          f"don't match the ticket number pattern.")
+        self._update_send_btn()
 
     def _scan_folder(self):
         if not self._folder:
