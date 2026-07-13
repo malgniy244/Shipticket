@@ -34,6 +34,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Callable
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -705,6 +706,7 @@ def run_detection_fast(
     model: str = DEFAULT_MODEL,
     dpi: int = 150,
     whitelist: list[str] | None = None,
+    progress_callback: "Callable[[int], None] | None" = None,
 ) -> tuple[list[dict], dict]:
     """
     Fast mode detection: lazy identification using local pink sticker boundaries.
@@ -812,6 +814,10 @@ def run_detection_fast(
         if p not in checkpoint or checkpoint[p].get("not_read", False)
     ]
     log.info("[fast] %d first-pages to read via API: %s", len(pending_read), pending_read)
+
+    # Emit not_read_count early so the progress watcher can use it immediately
+    if progress_callback:
+        progress_callback(len(not_read_pages))
 
     # ── First-pass: concurrent detection on first pages only ──
     _t_first_pass_start = _time.monotonic()

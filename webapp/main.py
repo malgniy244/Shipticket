@@ -179,8 +179,10 @@ def run_detection_background(job_id: str):
         batch_type = job.get("batch_type", "tib")
         fast_mode = job.get("fast_mode", False)
 
-        # Progress callback: update job["progress_page"] as pages complete
-        # We do this by polling the checkpoint file size
+        # Progress callback: update job["progress_page"] as pages complete.
+        # In fast mode, not_read pages are never written to the checkpoint.
+        # fast_mode_not_read is set on the job before API calls start so the
+        # watcher can add it to the checkpoint count for an accurate display.
         def progress_watcher():
             while True:
                 with jobs_lock:
@@ -190,10 +192,11 @@ def run_detection_background(job_id: str):
                 if Path(checkpoint_path).exists():
                     try:
                         with open(checkpoint_path) as f:
-                            done = len(json.load(f))
+                            checkpoint_entries = len(json.load(f))
                         with jobs_lock:
                             if jobs.get(job_id):
-                                jobs[job_id]["progress_page"] = done
+                                not_read_count = jobs[job_id].get("fast_mode_not_read", 0)
+                                jobs[job_id]["progress_page"] = checkpoint_entries + not_read_count
                     except Exception:
                         pass
                 time.sleep(1)
@@ -222,12 +225,18 @@ def run_detection_background(job_id: str):
             with jobs_lock:
                 if jobs.get(job_id):
                     jobs[job_id]["pink_diagnostics"] = pink_debug_results
+            def _set_not_read_count(count: int):
+                with jobs_lock:
+                    if jobs.get(job_id):
+                        jobs[job_id]["fast_mode_not_read"] = count
+
             detection_results, fast_metrics = run_detection_fast(
                 pdf_path=pdf_path,
                 pre_boundaries=pre_boundaries,
                 checkpoint_path=checkpoint_path,
                 workers=5,
                 whitelist=whitelist,
+                progress_callback=_set_not_read_count,
             )
             with jobs_lock:
                 if jobs.get(job_id):
