@@ -53,7 +53,7 @@ from grouping import (
     FLAG_LOW_CONFIDENCE, FLAG_CORRECTION_OBSERVED, FLAG_NON_CONTIGUOUS,
     FLAG_CORRECTION_CONFLICT, FLAG_NOT_READ,
 )
-from pink_detect import detect_pink_stickers_batch
+from pink_detect import detect_pink_stickers_batch, detect_pink_stickers_batch_debug
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -132,6 +132,10 @@ def make_job(job_id: str, whitelist: list[str], pdf_path: str, total_pages: int,
         "error": None,
         "created_at": time.time(),
         "thumbnail_dir": str(Path(pdf_path).parent / "thumbs"),
+        # Diagnostics (populated during detection)
+        "pink_diagnostics": None,    # list of per-page pink detector debug dicts (fast mode only)
+        "fast_mode_metrics": None,   # dict of fast-mode API call counts and wall clock
+        "confirmed_snapshot": None,  # frozen page→ticket map written at confirm time
     }
 
 
@@ -206,17 +210,29 @@ def run_detection_background(job_id: str):
                 for i in range(len(doc))
             ]
             doc.close()
-            pink_flags = detect_pink_stickers_batch(page_images)
+            # Use debug variant to capture per-page scores
+            pink_debug_results = detect_pink_stickers_batch_debug(page_images)
+            pink_flags = [r["detected"] for r in pink_debug_results]
+            # Annotate each debug result with its 1-indexed page number
+            for i, dbg in enumerate(pink_debug_results):
+                dbg["page"] = i + 1
             # pre_boundaries: 1-indexed page numbers where pink sticker detected
             pre_boundaries = [i + 1 for i, flag in enumerate(pink_flags) if flag]
             log.info("Job %s: pink boundaries detected on pages %s", job_id, pre_boundaries)
-            detection_results = run_detection_fast(
+            with jobs_lock:
+                if jobs.get(job_id):
+                    jobs[job_id]["pink_diagnostics"] = pink_debug_results
+            detection_results, fast_metrics = run_detection_fast(
                 pdf_path=pdf_path,
                 pre_boundaries=pre_boundaries,
                 checkpoint_path=checkpoint_path,
                 workers=5,
                 whitelist=whitelist,
             )
+            with jobs_lock:
+                if jobs.get(job_id):
+                    jobs[job_id]["fast_mode_metrics"] = fast_metrics
+            log.info("Job %s: fast mode metrics: %s", job_id, fast_metrics)
         else:
             # Full mode: run detection on all pages
             detection_results = run_detection(
@@ -842,9 +858,37 @@ async def confirm_job(job_id: str, _=Depends(require_session)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"ZIP build failed: {e}")
 
+    # Build confirmed_snapshot: frozen page→ticket mapping for fixture ground truth
+    confirmed_snapshot = {
+        "job_id": job_id,
+        "confirmed_at": datetime.now().isoformat(),
+        "whitelist": wl,
+        "batch_type": job.get("batch_type", "tib"),
+        "fast_mode": job.get("fast_mode", False),
+        "total_pages": job.get("total_pages"),
+        # page_map: {"1": "301532", "2": "301532", ...}
+        "page_map": {
+            str(pp["page"]): next(
+                (b["ticket"] for b in blocks if pp["page"] in b.get("pages", [])),
+                None,
+            )
+            for pp in review.get("per_page", [])
+        },
+        # blocks: [{ticket, pages, flags}, ...]
+        "blocks": [
+            {
+                "ticket": b["ticket"],
+                "pages": b.get("pages", []),
+                "flags": b.get("flags", []),
+            }
+            for b in blocks
+        ],
+    }
+
     with jobs_lock:
         job["zip_path"] = zip_path
         job["status"] = "confirmed"
+        job["confirmed_snapshot"] = confirmed_snapshot
 
     # Schedule cleanup after download (give 10 minutes to download)
     schedule_cleanup(job_id, delay=600)
@@ -901,6 +945,34 @@ def _build_zip(job: dict, review: dict) -> str:
             log.info("ZIP: added %s (%d pages: %s)", filename, len(pages), pages)
 
     return zip_path
+
+
+# ── Diagnostics endpoint ───────────────────────────────────────────────────────────────────
+
+@app.get("/api/jobs/{job_id}/diagnostics")
+async def get_diagnostics(job_id: str, _=Depends(require_session)):
+    """
+    Return pink detector diagnostics, fast-mode metrics, and confirmed snapshot for a job.
+
+    Available after detection completes (status=ready or confirmed).
+    pink_diagnostics: list of per-page dicts with blob area, fill ratio, hue range, etc.
+    fast_mode_metrics: API call counts, block ranges, wall clock (fast mode only).
+    confirmed_snapshot: frozen page→ticket mapping (available after confirm).
+    """
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] not in ("ready", "confirmed"):
+        raise HTTPException(status_code=409, detail=f"Job not ready (status={job['status']})")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "fast_mode": job.get("fast_mode", False),
+        "pink_diagnostics": job.get("pink_diagnostics"),
+        "fast_mode_metrics": job.get("fast_mode_metrics"),
+        "confirmed_snapshot": job.get("confirmed_snapshot"),
+    }
 
 
 # ── Static files (HTML/JS/CSS) ────────────────────────────────────────────────

@@ -84,7 +84,7 @@ def main():
     print(f"Pink boundaries detected: {pre_boundaries}")
 
     t0 = time.time()
-    results = run_detection_fast(
+    results, fast_metrics = run_detection_fast(
         pdf_path=PDF_PATH,
         pre_boundaries=pre_boundaries,
         whitelist=WHITELIST,
@@ -92,6 +92,7 @@ def main():
         model=DEFAULT_MODEL,
     )
     elapsed = time.time() - t0
+    print(f"Fast mode metrics: {fast_metrics}")
 
     # Build result dict by page
     by_page = {r["page"]: r for r in results}

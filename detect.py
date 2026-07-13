@@ -705,7 +705,7 @@ def run_detection_fast(
     model: str = DEFAULT_MODEL,
     dpi: int = 150,
     whitelist: list[str] | None = None,
-) -> list[dict]:
+) -> tuple[list[dict], dict]:
     """
     Fast mode detection: lazy identification using local pink sticker boundaries.
 
@@ -719,12 +719,30 @@ def run_detection_fast(
         as detected by local pink sticker detection. Page 1 is always included.
     whitelist: if provided, enables second-pass detection for orphan-candidate pages.
 
-    Returns the same format as run_detection() but with not_read pages included.
+    Returns:
+        (page_results, metrics) where:
+          page_results: same format as run_detection() but with not_read pages included.
+          metrics: dict with fast-mode diagnostics:
+            total_pages, block_count, block_ranges,
+            api_calls_first_pass, api_calls_progressive, api_calls_sticker_retry,
+            api_calls_second_pass, api_calls_total,
+            not_read_count, read_count,
+            wall_clock_seconds, wall_clock_first_pass_seconds
     DETECTION_FAILED semantics are unchanged for pages that are actually read.
     """
     from pink_detect import detect_pink_sticker  # local, no API
+    import time as _time
 
     client = OpenAI()
+    _t_start = _time.monotonic()
+
+    # Metrics tracking
+    _metrics: dict = {
+        "api_calls_first_pass": 0,
+        "api_calls_progressive": 0,
+        "api_calls_sticker_retry": 0,
+        "api_calls_second_pass": 0,
+    }
 
     # Load checkpoint if it exists
     checkpoint: dict[int, dict] = {}
@@ -796,6 +814,8 @@ def run_detection_fast(
     log.info("[fast] %d first-pages to read via API: %s", len(pending_read), pending_read)
 
     # ── First-pass: concurrent detection on first pages only ──
+    _t_first_pass_start = _time.monotonic()
+    _metrics["api_calls_first_pass"] = len(pending_read)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
             executor.submit(detect_page, client, pn, page_images[pn], model): pn
@@ -815,6 +835,7 @@ def run_detection_fast(
                 }
             results[pn] = result
             save_checkpoint()
+    _t_first_pass_end = _time.monotonic()
 
     # ── Progressive fallback: for unresolved first pages, read inner pages ──
     # For each block where the first page is unresolved (no whitelist match),
@@ -842,6 +863,7 @@ def run_detection_fast(
         log.info("[fast] Progressive fallback: reading %d inner pages: %s", len(progressive_pages), progressive_pages)
         # Filter out already-checkpointed pages
         pending_progressive = [p for p in progressive_pages if p not in checkpoint]
+        _metrics["api_calls_progressive"] = len(pending_progressive)
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
                 executor.submit(detect_page, client, pn, page_images[pn], model): pn
@@ -870,6 +892,7 @@ def run_detection_fast(
     ]
     if empty_read_pages:
         log.info("[fast] Sticker-retry on %d empty read pages: %s", len(empty_read_pages), empty_read_pages)
+        _metrics["api_calls_sticker_retry"] = len(empty_read_pages)
         with ThreadPoolExecutor(max_workers=workers) as executor:
             retry_futures = {
                 executor.submit(detect_page_sticker_retry, client, pn, page_images[pn], model): pn
@@ -907,6 +930,7 @@ def run_detection_fast(
         ]
         if second_pass_pages:
             log.info("[fast] Second-pass on %d orphan read pages: %s", len(second_pass_pages), second_pass_pages)
+            _metrics["api_calls_second_pass"] = len(second_pass_pages)
             for pn in second_pass_pages:
                 candidate = detect_page_second_pass(client, pn, page_images[pn], whitelist, model)
                 if candidate is None:
@@ -941,8 +965,26 @@ def run_detection_fast(
         total_pages, len(read_pages), len(not_read_pages),
     )
 
+    _t_end = _time.monotonic()
+    _metrics["api_calls_total"] = (
+        _metrics["api_calls_first_pass"]
+        + _metrics["api_calls_progressive"]
+        + _metrics["api_calls_sticker_retry"]
+        + _metrics["api_calls_second_pass"]
+    )
+    _metrics["total_pages"] = total_pages
+    _metrics["block_count"] = len(block_ranges)
+    _metrics["block_ranges"] = [[s, e] for s, e in block_ranges]
+    _metrics["read_count"] = len(read_pages)
+    _metrics["not_read_count"] = len(not_read_pages)
+    _metrics["wall_clock_seconds"] = round(_t_end - _t_start, 2)
+    _metrics["wall_clock_first_pass_seconds"] = round(
+        _t_first_pass_end - _t_first_pass_start, 2
+    )
+    log.info("[fast] Metrics: %s", _metrics)
+
     # Return sorted by page number
-    return [results[i + 1] for i in range(total_pages)]
+    return [results[i + 1] for i in range(total_pages)], _metrics
 
 
 def main():
