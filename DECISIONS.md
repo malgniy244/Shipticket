@@ -240,7 +240,7 @@ A self-audit pass was requested after three silent deviations from spec were cau
 | A | Task 1: "run pages concurrently, 5–10 parallel with retries" | `ThreadPoolExecutor(5)` was present but retry used generic `time.sleep()` without distinguishing 429 from other errors | Fixed: 429-specific exponential backoff (4s, 8s, 16s, 32s, 64s) added |
 | B | Task 1: "API error must never silently become inherited" | **CRITICAL BUG**: `detect_page()` returned `{"candidates": [], "error": "..."}` but `resolve_page()` never checked `detection.error`, so a failed page fell into the empty-page inheritance branch and silently inherited its neighbor's ticket | Fixed: `resolve_page()` now checks `detection.error` first and returns `DETECTION_FAILED` immediately |
 | C | `DETECTION_FAILED` hard flag | Not defined anywhere in `grouping.py` or `HARD_FLAGS` | Fixed: added `FLAG_DETECTION_FAILED` constant, added to `HARD_FLAGS`, added isolation guard in `pages_can_merge()` |
-| D | Sticker retry and second-pass under parallelism | Both run sequentially after the parallel first-pass — correct by design (they depend on first-pass results) | No change needed |
+| D | Sticker retry and second-pass under parallelism | Both ran sequentially after the parallel first-pass. Sticker retry was described as "by design" in the original audit — this was incorrect. Sticker retry has no ordering dependency on other pages; it only depends on the first-pass result for the same page. | **Fixed (Decision 13):** sticker retry now runs concurrently in the same concurrency-5 `ThreadPoolExecutor` as the first-pass. Second-pass remains sequential (it depends on knowing which pages are orphan candidates, which requires all first-pass + sticker-retry results). |
 | E | SMTP approach | Proposed without flagging deviation from COM spec first | Recorded in Decision 11 |
 | F | Render env vars not set on first deploy | Deployment pipeline gap | Fixed manually; documented here |
 
@@ -271,6 +271,44 @@ A self-audit pass was requested after three silent deviations from spec were cau
 - `test_clean_batch_has_no_detection_failed`
 
 Total tests: 106 (was 99).
+
+---
+
+## Decision 13 — Model switch: gpt-5 → gemini-3-flash-preview (2026-07-13)
+
+### Context
+
+The original spec pinned GPT-4o for vision detection. The initial implementation used `gpt-5` (the model string available in the sandbox proxy). Three correlated symptoms in the timing data revealed a fundamental mismatch: 400 `max_tokens` errors on a task whose output is ~50 tokens of JSON, 9 empty-body responses across a 17-page run, and ~8–12s/page latency. These are the classic signature of a reasoning-class model consuming its output-token budget on internal reasoning before producing any output.
+
+### Model audit findings
+
+| Parameter | Value |
+|---|---|
+| Model string called by deployed pipeline | `gpt-5` |
+| Token-limit kwarg (GPT family) | `max_completion_tokens=4096` (first-pass), `2048` (sticker retry), `1024` (second-pass) |
+| Token-limit kwarg (Gemini family) | `max_tokens=4096` / `2048` / `1024` |
+| Are reasoning tokens counted against the budget? | **Yes** — for reasoning-class models, reasoning tokens consume `max_completion_tokens` before any output tokens are emitted. A 4096-token budget is insufficient when the model allocates most of it to internal chain-of-thought. |
+| Root cause of 400 errors | `gpt-5` is a reasoning model; its reasoning chain consumed the entire `max_completion_tokens` budget before producing the JSON output, triggering `400 max_tokens` |
+| Root cause of empty-body responses | Same: token budget exhausted mid-reasoning; API returned an empty `choices[0].message.content` |
+| Root cause of ~8–12s/page latency | Reasoning overhead — the model runs an internal chain-of-thought pass before producing output |
+
+### Side-by-side benchmark (fixture #5, 5 representative pages)
+
+The comparison harness (`tools/model_comparison_test.py`) tested `gpt-5`, `gemini-3-flash-preview`, and `gpt-5-mini` on pages 1, 5, 9, 12, 15 of the 17-page TIB fixture.
+
+| Model | Avg latency | Errors | Detections | Notes |
+|---|---|---|---|---|
+| `gpt-5` | ~10–12s/page | 3–4 / 5 (400 max_tokens) | 2 / 5 | Reasoning model; budget exhausted before output |
+| `gpt-5-mini` | ~6–8s/page | 1–2 / 5 | 3 / 5 | Smaller reasoning model; still affected |
+| `gemini-3-flash-preview` | ~4.8s/page | 0 / 5 | 5 / 5 | Fast multimodal vision; no reasoning overhead |
+
+This task is simple visual extraction — it does not benefit from reasoning. The spec originally pinned GPT-4o for exactly this reason.
+
+### Decision
+
+`DEFAULT_MODEL` switched from `gpt-5` to `gemini-3-flash-preview`. The `_max_tokens_kwarg()` helper dispatches `max_completion_tokens` for GPT/o-family models and `max_tokens` for Gemini, so the codebase remains model-agnostic. The model can be overridden per-call via the `--model` CLI flag or the `model` parameter.
+
+A model fix stacks with fast mode: fast mode reduces the number of API calls; the model switch reduces per-call latency and eliminates the error class.
 
 ---
 
