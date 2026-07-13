@@ -351,6 +351,7 @@ def resolve_page(detection: PageDetection, whitelist: list[str]) -> ResolvedPage
 def build_blocks(
     resolved_pages: list[ResolvedPage],
     whitelist: list[str],
+    forced_boundaries: "set[int] | None" = None,
 ) -> GroupingResult:
     """
     Apply rules 5–8 from spec section 3.4 to build the final block list.
@@ -362,9 +363,14 @@ def build_blocks(
               If that ticket conflicts with what inheritance would give AND
               confidence is low → AMBIGUOUS_MATCH hard flag instead.
       Step 2: Else if the raw unmatched value is within edit-distance ≤ 2 of the
-              previous block's ticket → inherit with INHERITED_UNMATCHED soft flag.
+              previous block’s ticket → inherit with INHERITED_UNMATCHED soft flag.
       Step 3: Otherwise → keep UNMATCHED_NUMBER hard flag (unchanged).
+
+    forced_boundaries: optional set of 1-indexed page numbers that must start a
+        new block regardless of ticket identity. Used by fast mode to honour the
+        pink-sticker boundaries detected locally before any API calls.
     """
+    _forced: set[int] = forced_boundaries if forced_boundaries else set()
     total_pages = len(resolved_pages)
 
     # ── Rule 5: Inheritance + UNMATCHED pipeline ──
@@ -581,7 +587,9 @@ def build_blocks(
         ))
 
     for rp in inherited[1:]:
-        if pages_can_merge(current_rp, rp):
+        # Forced boundary: pink sticker detected on this page — always start a new block
+        force_split = rp.page in _forced
+        if not force_split and pages_can_merge(current_rp, rp):
             current_pages.append(rp.page)
             current_flags.extend(rp.flags)
             current_sources.extend(rp.detection_sources)
@@ -737,6 +745,7 @@ def group_detections(
     raw_detections: list[dict],
     whitelist: list[str],
     batch_type: str = "tib",
+    pre_boundaries: "list[int] | None" = None,
 ) -> GroupingResult:
     """
     Main entry point.
@@ -770,7 +779,13 @@ def group_detections(
 
     page_detections.sort(key=lambda p: p.page)
     resolved = [resolve_page(pd, whitelist) for pd in page_detections]
-    result = build_blocks(resolved, whitelist)
+    # Fast mode: pass pink-sticker pages as forced block boundaries.
+    # Page 1 is always a boundary by definition so we exclude it (build_blocks
+    # starts the first block unconditionally).
+    forced: set[int] | None = None
+    if pre_boundaries:
+        forced = {p for p in pre_boundaries if p > 1}
+    result = build_blocks(resolved, whitelist, forced_boundaries=forced)
 
     # ── Proposal-layer flags (batch_type-specific, never affect core rules) ──
     # Build a lookup: page → raw detection dict (for pink_marker access)

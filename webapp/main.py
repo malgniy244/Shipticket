@@ -225,6 +225,7 @@ def run_detection_background(job_id: str):
             with jobs_lock:
                 if jobs.get(job_id):
                     jobs[job_id]["pink_diagnostics"] = pink_debug_results
+                    jobs[job_id]["pre_boundaries"] = pre_boundaries
             def _set_not_read_count(count: int):
                 with jobs_lock:
                     if jobs.get(job_id):
@@ -257,7 +258,15 @@ def run_detection_background(job_id: str):
             job["status"] = "grouping"
 
         # Run grouping
-        grouping_result = group_detections(detection_results, whitelist, batch_type=batch_type)
+        # In fast mode, pass the pink-sticker boundaries as forced block starts
+        # so Phase A shows the correct proposed boundaries (not identity-derived ones).
+        with jobs_lock:
+            _pre_boundaries = jobs.get(job_id, {}).get("pre_boundaries") if fast_mode else None
+        grouping_result = group_detections(
+            detection_results, whitelist,
+            batch_type=batch_type,
+            pre_boundaries=_pre_boundaries,
+        )
 
         # Build review_state from grouping result (with per_page decisions for filmstrip)
         review_state = build_review_state(grouping_result, whitelist, detection_results)
