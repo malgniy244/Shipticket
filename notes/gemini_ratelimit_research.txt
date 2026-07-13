@@ -1,0 +1,47 @@
+Gemini API Rate Limit Research — 2026-07-13
+==========================================
+
+Source: https://ai.google.dev/gemini-api/docs/rate-limits
+Source: https://ai.google.dev/gemini-api/docs/openai
+
+RATE LIMIT ERROR FORMAT
+-----------------------
+- HTTP status: 429
+- Error code string: "RESOURCE_EXHAUSTED" (Google's own error code)
+- Via OpenAI-compatible endpoint: raises openai.RateLimitError with HTTP 429
+- Error message typically contains: "429", "RESOURCE_EXHAUSTED", "resource exhausted", "quota"
+- Example message: "Error code: 429 - {'error': {'code': 429, 'message': 'RESOURCE_EXHAUSTED: ...'}}"
+
+CURRENT DETECT.PY RATE-LIMIT DETECTION (line 267):
+  is_rate_limit = "429" in last_exc_str or "rate limit" in exc_str_lower or "rate_limit" in exc_str_lower
+
+COVERAGE ANALYSIS:
+- "429" in last_exc_str: YES — catches Gemini 429 RESOURCE_EXHAUSTED (HTTP 429 is in the error string)
+- "rate limit" / "rate_limit": catches OpenAI-style messages
+- MISSING: "resource_exhausted" / "RESOURCE_EXHAUSTED" — Gemini-specific error code
+  → If the proxy surfaces "RESOURCE_EXHAUSTED" without "429" in the string, it would fall through
+    to the generic 1s/2s/4s backoff instead of the 4s/8s/16s rate-limit backoff
+  → HOWEVER: via OpenAI-compatible endpoint, the HTTP status IS 429, so "429" will always be
+    in the exception string from the openai library (openai.RateLimitError always includes HTTP 429)
+
+CONCLUSION: Current detection is adequate for the OpenAI-compatible Gemini endpoint.
+The "429" string check catches all Gemini rate limits surfaced via the openai library.
+Adding "resource_exhausted" as a belt-and-suspenders check is recommended.
+
+GEMINI FLASH RATE LIMITS (gemini-3-flash-preview, Tier 1):
+- Rate limits are model-specific and shown in AI Studio
+- Preview models have MORE RESTRICTED rate limits than stable models
+- 429 RESOURCE_EXHAUSTED is the error for both RPM and spend-based limits
+- Spend-based: $10/10min rolling window for Tier 1
+
+OPENAI COMPATIBILITY NOTE:
+- Gemini OpenAI-compatible endpoint: https://generativelanguage.googleapis.com/v1beta/openai/
+- The sandbox proxy routes to this endpoint transparently
+- Error format via openai library: openai.RateLimitError with status_code=429
+- The exception str() includes "429" so current detection works
+
+PREVIEW MODEL RISK:
+- "gemini-3-flash-preview" is a preview model
+- Preview models can be deprecated or changed without notice
+- Rate limits are more restricted for preview models
+- Should be replaced with stable model when available (e.g., "gemini-3-flash" or "gemini-3.5-flash")

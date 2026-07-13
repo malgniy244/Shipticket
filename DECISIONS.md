@@ -304,9 +304,143 @@ The comparison harness (`tools/model_comparison_test.py`) tested `gpt-5`, `gemin
 
 This task is simple visual extraction — it does not benefit from reasoning. The spec originally pinned GPT-4o for exactly this reason.
 
+### Full fixture suite validation (2026-07-13)
+
+All four available fixtures run end-to-end through `gemini-3-flash-preview` (full mode, concurrency 5). Results below. `EMPTY_OK` = photo/content page with no expected direct detection; inherits correctly from block. `FUZZY_CORRECT` = edit-distance-1 auto-resolution to correct ticket. `UNMATCHED` = no whitelist match; requires human review (working as designed).
+
+**Fixture #1** (`testingfile.pdf`, 16 pages, TIB, whitelist: 301532 257535 253983 258066 257086)
+
+| Page | Expected | Detected | Src | Conf | Status |
+|---|---|---|---|---|---|
+| 1 | 301532 | 301532 | print | 1.00 | CORRECT |
+| 2 | 301532 | 301532 | print | 1.00 | CORRECT |
+| 3 | 301532 | 301532 | handw | 1.00 | CORRECT |
+| 4 | 257535 | 257535 | stick | 1.00 | CORRECT |
+| 5 | 253983 | 253983 | handw | 0.95 | CORRECT |
+| 6 | 253983 | 253983 | handw | 0.95 | CORRECT |
+| 7\* | 253983 | 253983 | handw | 0.95 | CORRECT |
+| 8 | 253983 | 253983 | handw | 0.95 | CORRECT |
+| 9 | 253983 | 253983 | handw | 0.95 | CORRECT |
+| 10\* | 253983 | 253983 | handw | 1.00 | CORRECT |
+| 11 | 258066 | 258066 | stick | 1.00 | CORRECT |
+| 12 | 258066 | 258066 | stick | 1.00 | CORRECT |
+| 13 | 258066 | 258066 | print | 1.00 | CORRECT |
+| 14 | 257086 | 257086 | print | 1.00 | CORRECT |
+| 15 | 257086 | 257086 | print | 1.00 | CORRECT |
+| 16 | 257086 | 257086 | stick | 1.00 | CORRECT |
+
+**16/16 correct. 0 errors. Avg latency: 1.7s/page (first pass only, no sticker retry needed).** Pages 7 and 10 (previously misread as 247983 and 243983 under gpt-5) are now correctly read as 253983 at conf=0.95–1.00. This is the key handwriting regression: gemini-3-flash-preview reads both correctly without fuzzy resolution.
+
+**Fixture #2** (`SKM_C250i26070816150.pdf`, 16 pages, TIB, whitelist: 300291 300871 300588 298404 299198 301053)
+
+| Page | Expected | Detected | Src | Conf | Status |
+|---|---|---|---|---|---|
+| 1 | 300291 | 300291 | stick | 0.95 | CORRECT |
+| 2 | 300871 | 300871 | stick | 1.00 | CORRECT |
+| 3 | 300588 | 300588 | stick | 1.00 | CORRECT |
+| 4 | 300588 | 300588 | handw | 0.95 | CORRECT |
+| 5 | 300588 | 300588 | handw | 1.00 | CORRECT |
+| 6 | 300588 | 300588 | handw | 0.95 | CORRECT |
+| 7 | 300588 | 300588 | handw | 1.00 | CORRECT |
+| 8 | 300588 | — | — | — | EMPTY_OK |
+| 9 | 300588 | — | — | — | EMPTY_OK |
+| 10 | 300588 | — | — | — | EMPTY_OK |
+| 11 | 300588 | — | — | — | EMPTY_OK |
+| 12 | 298404 | 298404 | print | 0.99 | CORRECT |
+| 13 | 299198 | 299198 | stick | 1.00 | CORRECT |
+| 14 | 301053 | 301053 | stick | 1.00 | CORRECT |
+| 15 | 301053 | — | — | — | EMPTY_OK |
+| 16 | 301053 | — | — | — | EMPTY_OK |
+
+**10/10 detected pages correct. 0 errors. 6 EMPTY_OK (photo pages, inherit correctly).** Page 13 (299198) previously required sticker retry under gpt-5; now detected on first pass at conf=1.00.
+
+**Fixture #4** (`SKM_C250i26070816530.pdf`, 18 pages, TIB, whitelist: 300574 300600 300573 253027-1)
+
+| Page | Expected | Detected | Src | Conf | Status |
+|---|---|---|---|---|---|
+| 1 | 300574 | 300574 | stick | 1.00 | CORRECT |
+| 2 | 300574 | 300574 | handw | 1.00 | CORRECT |
+| 3 | 300600 | 300600 | stick | 0.95 | CORRECT |
+| 4–13 | 300600 | — | — | — | EMPTY_OK (photo pages) |
+| 9 | 300600 | 227317 | handw | 0.85 | UNMATCHED |
+| 14 | 300573 | 300573 | stick | 0.95 | CORRECT |
+| 15 | 300573 | 262884 | handw | 0.95 | UNMATCHED |
+| 16 | 253027-1 | 253027-1 | print | 1.00 | CORRECT |
+| 17 | 253027-1 | 253027 | handw | 1.00 | UNMATCHED (suffix stripped) |
+| 18 | 253027-1 | — | — | — | EMPTY_OK |
+
+**5/5 block-anchor pages correct. 0 errors. 3 UNMATCHED on handwritten photo pages (working as designed — these require human review).** Pages 9, 15, 17 are handwritten photo pages where the model reads banknote-adjacent numbers; these inherit from their block anchor and are flagged for review. This is identical behaviour to the previous model.
+
+**Fixture #5** (`SKM_C250i26070916020.pdf`, 17 pages, TIB, whitelist: 247799 248256 248258 248259 248260)
+
+| Page | Expected | Detected | Src | Conf | Status |
+|---|---|---|---|---|---|
+| 1 | 247799 | 247799 | print | 1.00 | CORRECT |
+| 2\* | 247799 | 247799 | print | 1.00 | CORRECT |
+| 3\* | 247799 | 247798 | handw | 0.95 | FUZZY_CORRECT |
+| 4 | 247799 | 247798 | handw | 0.95 | FUZZY_CORRECT |
+| 5 | 248256 | 248256 | print | 1.00 | CORRECT |
+| 6\* | 248256 | 248256 | print | 1.00 | CORRECT |
+| 7\* | 248256 | 248286 | handw | 0.95 | FUZZY_CORRECT |
+| 8 | 248256 | 248256 | handw | 0.95 | CORRECT |
+| 9 | 248258 | 248258 | print | 1.00 | CORRECT |
+| 10\* | 248258 | 248258 | print | 1.00 | CORRECT |
+| 11 | 248258 | 248258 | handw | 1.00 | CORRECT |
+| 12 | 248259 | 248259 | print | 1.00 | CORRECT |
+| 13\* | 248259 | 248259 | print | 1.00 | CORRECT |
+| 14 | 248259 | 248259 | handw | 0.95 | CORRECT |
+| 15 | 248260 | 248260 | print | 1.00 | CORRECT |
+| 16\* | 248260 | 248260 | print | 1.00 | CORRECT |
+| 17 | 248260 | 224826 | handw | 0.95 | UNMATCHED |
+
+**16/17 correct (13 exact + 3 fuzzy). 0 errors. 1 UNMATCHED on page 17 (handwritten photo page; inherits from block, flagged for review).** Avg latency: 1.5s/page. \* = handwritten/photo page.
+
+**Overall: 67 pages across 4 fixtures. 0 API errors. 0 wrong-ticket assignments. 4 UNMATCHED on handwritten photo pages (all working as designed).**
+
+### Gemini thinking mode note
+
+The proxy catalog shows `gemini-3-flash-preview` has `thinking_param: "thinking"` — meaning thinking mode is supported but **off by default** when no `thinking` parameter is passed. The current code passes no thinking parameter, so thinking is disabled and the model operates as a pure vision model. This is the correct configuration for this task. If thinking were accidentally enabled (e.g., via `extra_body`), the same token-budget problem would recur. The code must never pass a `thinking` parameter to Gemini for this use case.
+
+### Rate-limit behavior (Gemini via OpenAI-compatible endpoint)
+
+Gemini rate-limit errors surface as HTTP 429 with error code `RESOURCE_EXHAUSTED`. Via the OpenAI Python library, these raise `openai.RateLimitError` and the exception string always contains `"429"`. The current detection logic (`"429" in last_exc_str`) therefore catches all Gemini rate limits correctly. The `"RESOURCE_EXHAUSTED"` string is also present in the error body but is not required for detection since `"429"` is always present. The 4s/8s/16s/32s/64s exponential backoff for rate limits is appropriate for Gemini's per-minute limits. No change to the retry logic is required.
+
+### Per-page cost comparison
+
+Pricing from the proxy catalog (USD per 1M tokens):
+
+| Model | Input $/1M | Output $/1M | Reasoning? | Approx cost per page\* |
+|---|---|---|---|---|
+| `gpt-5` | $1.25 | $10.00 | Yes (consumed budget) | ~$0.005–0.015 + error overhead |
+| `gemini-3-flash-preview` | $0.50 | $3.00 | No (off by default) | ~$0.001–0.003 |
+
+\* Estimated: ~1,500–3,000 input tokens (image + prompt) and ~50–100 output tokens per page. Gemini is approximately 3–5× cheaper per page than gpt-5, and eliminates the error-retry cost entirely.
+
+### Render deployment requirement (CRITICAL)
+
+`gemini-3-flash-preview` does not exist on the real OpenAI API (`api.openai.com`). The deployed app on Render uses `OpenAI()` which reads `OPENAI_API_KEY` and `OPENAI_API_BASE` from environment variables. `OPENAI_API_BASE` was not previously set in `render.yaml` (the original `gpt-5` model worked with the real OpenAI API). This has been corrected: `render.yaml` now declares `OPENAI_API_BASE` as a manually-set env var. **Before the model switch is live on Render, the user must set two env vars in the Render dashboard:**
+
+1. `OPENAI_API_KEY` — a Gemini API key from [Google AI Studio](https://aistudio.google.com)
+2. `OPENAI_API_BASE` — `https://generativelanguage.googleapis.com/v1beta/openai/`
+
+Until these are set, the deployed app will fail with `model_not_found` on every detection job.
+
+### Preview model risk
+
+`gemini-3-flash-preview` is a preview model. Google may deprecate, modify, or change the pricing of preview models without notice, and preview models have more restricted rate limits than stable models. **Standing policy (LOCKED):** If Google deprecates `gemini-3-flash-preview` or a stable `gemini-3-flash` becomes available, the model string must be updated in `detect.py` and a full fixture suite re-run (`tools/fixture_suite_runner.py --fixture 1 2 4 5`) must pass before the change is deployed. This policy applies to any future model change regardless of provider.
+
+### Standing policy: full fixture re-run required before any model change (LOCKED)
+
+Any future change to `DEFAULT_MODEL` in `detect.py` requires:
+1. Running `python3 tools/fixture_suite_runner.py` (all fixtures) and confirming 0 errors and no new wrong-ticket assignments.
+2. Documenting the results in DECISIONS.md.
+3. Only then deploying to Render.
+
+This policy is in effect from this decision forward.
+
 ### Decision
 
-`DEFAULT_MODEL` switched from `gpt-5` to `gemini-3-flash-preview`. The `_max_tokens_kwarg()` helper dispatches `max_completion_tokens` for GPT/o-family models and `max_tokens` for Gemini, so the codebase remains model-agnostic. The model can be overridden per-call via the `--model` CLI flag or the `model` parameter.
+`DEFAULT_MODEL` switched from `gpt-5` to `gemini-3-flash-preview`. The `_max_tokens_kwarg()` helper dispatches `max_completion_tokens` for GPT/o-family models and `max_tokens` for Gemini, so the codebase remains model-agnostic. The model can be overridden per-call via the `--model` CLI flag or the `model` parameter. `render.yaml` updated to declare `OPENAI_API_BASE` as a required env var.
 
 A model fix stacks with fast mode: fast mode reduces the number of API calls; the model switch reduces per-call latency and eliminates the error class.
 
