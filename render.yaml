@@ -8,9 +8,10 @@ services:
     envVars:
       - key: OPENAI_API_KEY
         sync: false   # set manually: use your Gemini API key from Google AI Studio (aistudio.google.com)
-      - key: OPENAI_API_BASE
+      - key: OPENAI_BASE_URL
         sync: false   # set manually: https://generativelanguage.googleapis.com/v1beta/openai/
                       # (Decision 13: model switched to gemini-3-flash-preview; requires Google's OpenAI-compat endpoint)
+                      # NOTE: OpenAI Python library reads OPENAI_BASE_URL, NOT OPENAI_API_BASE (Decision 15)
       - key: APP_PASSWORD
         sync: false   # set manually in Render dashboard
       - key: SESSION_SECRET

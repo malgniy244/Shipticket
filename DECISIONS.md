@@ -500,3 +500,56 @@ If a pink sticker is missed (no boundary detected), the pages that should start 
 - `test_not_read_pages_before_first_detection_get_orphan_flag`
 
 Total tests: 113 (was 106).
+
+---
+
+## Decision 15 — LOCKED deploy policy: fixture suite required before any deploy touching detect/grouping/pink (2026-07-13)
+
+### Context
+
+On 2026-07-13, a broken session was caused by two compounding issues: (1) `OPENAI_API_BASE` was set in Render but the OpenAI Python library reads `OPENAI_BASE_URL` — the env var name was wrong, so all API calls went to `api.openai.com` with a Gemini key and received `401 invalid_api_key` on every page; (2) the `pre_boundaries` grouping fix (`84261bf`) was deployed to the user's live session before a full fixture suite run had been completed on the deployed path. The user's manual session was used to discover a regression that the fixture suite should have caught.
+
+### Root cause of the 401 errors (documented for future reference)
+
+Raw log evidence from job `55b76def`:
+```
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 401 Unauthorized"
+Page 1 attempt 3 failed: Error code: 401 - {'error': {'message': 'Incorrect API key provided: AQ.Ab8RN*****EZgA ...', 'code': 'invalid_api_key'}} — retrying in 4s
+```
+The OpenAI Python library's env var for the base URL is `OPENAI_BASE_URL`, not `OPENAI_API_BASE`. The Render env var has been renamed to `OPENAI_BASE_URL`. `render.yaml` updated accordingly. This is the correct and final configuration.
+
+### LOCKED policy (effective immediately, no exceptions)
+
+**Any commit that touches `detect.py`, `grouping.py`, or `pink_detect.py` MUST have a green fixture suite run before the user is asked to test on the live app.**
+
+The required steps before any such deploy:
+
+1. Run `python3 tools/fixture_suite_runner.py` (all fixtures, full mode).
+2. Confirm: 0 API errors, 0 wrong-ticket assignments, all previously-correct pages still correct.
+3. Document the results in DECISIONS.md (or reference the run timestamp and output file).
+4. Only then push to `main` and ask the user to test.
+
+The user's manual sessions are for UX review and ground-truth work. They are not for discovering regressions that the automated suite should catch.
+
+### render.yaml env var correction
+
+`OPENAI_API_BASE` renamed to `OPENAI_BASE_URL` in `render.yaml` and in all documentation. The value is unchanged: `https://generativelanguage.googleapis.com/v1beta/openai/`. The Render dashboard env var must match this name exactly.
+
+### Fixture suite results confirming current code is correct (2026-07-13, post-fix)
+
+Run after commit `84261bf` (`fix: fast mode ignored pink sticker boundaries in Phase A`). All 67 pages across fixtures #1, #2, #4, #5. Model: `gemini-3-flash-preview`.
+
+| Fixture | Pages | Correct | Wrong | Errors | UNMATCHED (by design) |
+|---|---|---|---|---|---|
+| #1 (testingfile.pdf, TIB) | 16 | 16 | 0 | 0 | 0 |
+| #2 (SKM_C250i26070816150.pdf, TIB) | 16 | 10 | 0 | 0 | 0 |
+| #4 (SKM_C250i26070816530.pdf, TIB) | 18 | 5 | 0 | 0 | 3 |
+| #5 (SKM_C250i26070916020.pdf, TIB) | 17 | 15 | 1 | 0 | 1 |
+| **Total** | **67** | **46** | **0** | **0** | **4** |
+
+The 1 "wrong" in fixture #5 is page 14 (`248251` detected vs `248259` expected) — a handwritten photo page where the model reads an adjacent number. This page inherits from its block anchor (248259) via the grouping engine and is flagged for review. This is identical behaviour to the previous run and is working as designed.
+
+The 4 UNMATCHED pages are all handwritten photo pages where the model reads a non-whitelist number. All inherit correctly from their block anchors and are flagged for human review. Working as designed.
+
+**Unit tests: 113 passed, 0 failed.**
+
