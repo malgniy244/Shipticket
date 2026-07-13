@@ -19,9 +19,13 @@ AMENDMENT (Decision 8, 2026-07-09):
 
 from __future__ import annotations
 
+import logging
 import re
+import sys
 from dataclasses import dataclass, field
 from typing import Optional
+
+log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -45,10 +49,11 @@ FLAG_SECOND_PASS = "SECOND_PASS"                # soft: found via whitelist-cont
 FLAG_INHERITED_UNMATCHED = "INHERITED_UNMATCHED"  # soft: unmatched page inherited from prev block
 FLAG_NO_PRINTED_COVER = "NO_PRINTED_COVER"       # soft (TIB only): block start not a printed cover
 FLAG_PINK_MARKER = "PINK_MARKER"                 # soft (non-TIB): boundary signal page
+FLAG_DETECTION_FAILED = "DETECTION_FAILED"       # hard: API error after all retries — must not inherit
 
 # Hard flags that block Confirm until resolved
 HARD_FLAGS = {FLAG_UNMATCHED_NUMBER, FLAG_AMBIGUOUS_SUFFIX, FLAG_AMBIGUOUS_MATCH,
-              FLAG_ORPHAN_LEADING_PAGES}
+              FLAG_ORPHAN_LEADING_PAGES, FLAG_DETECTION_FAILED}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -183,7 +188,28 @@ def resolve_page(detection: PageDetection, whitelist: list[str]) -> ResolvedPage
     """
     Apply rules 1–4 from spec section 3.4 to a single page's candidates.
     Returns a ResolvedPage (ticket may be None if unresolved).
+
+    CRITICAL: If detection.error is set (API failure after all retries), return
+    a hard DETECTION_FAILED flag immediately. This page must NEVER be treated as
+    an empty page and must never silently inherit from a neighbor.
     """
+    # —— API failure guard: must be checked before anything else ——
+    if detection.error:
+        log.error(
+            "Page %d has detection error: %s — flagging as DETECTION_FAILED",
+            detection.page, detection.error,
+        )
+        return ResolvedPage(
+            page=detection.page,
+            resolved_ticket=None,
+            flags=[FLAG_DETECTION_FAILED],
+            detection_sources=[],
+            max_confidence=0.0,
+            unmatched_raw=[],
+            corrected_from=None,
+            suggestion=None,
+        )
+
     candidates = detection.candidates
     flags: list[str] = []
     unmatched_raw: list[str] = []
@@ -337,6 +363,12 @@ def build_blocks(
                 first_resolved_idx = i
             inherited.append(rp)
 
+        elif FLAG_DETECTION_FAILED in rp.flags:
+            # API error after all retries — NEVER inherit, keep hard flag as-is.
+            # This page is a blocker: Confirm is disabled until the reviewer
+            # manually assigns a ticket or the page is re-detected.
+            inherited.append(rp)
+
         elif FLAG_UNMATCHED_NUMBER in rp.flags or FLAG_AMBIGUOUS_SUFFIX in rp.flags:
             # ── Three-step UNMATCHED pipeline ──
             if first_resolved_idx is None:
@@ -460,6 +492,9 @@ def build_blocks(
             same primary raw unmatched value (so different misreads don't merge)
         """
         if rp_a.resolved_ticket != rp_b.resolved_ticket:
+            return False
+        # DETECTION_FAILED pages must never merge — each is its own isolated block
+        if FLAG_DETECTION_FAILED in rp_a.flags or FLAG_DETECTION_FAILED in rp_b.flags:
             return False
         if rp_a.resolved_ticket is None:
             # Both unresolved — only merge if same raw value (or both empty)

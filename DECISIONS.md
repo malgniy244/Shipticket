@@ -221,3 +221,53 @@ The user created an Azure app registration (Client ID: `61249134-e089-422b-bd52-
 **Build distribution:** GitHub Actions workflow on `windows-latest` runner builds `STS-Sender.exe` (PyInstaller `--onefile --windowed`) on every push to `sender/`. Artifact retained 90 days. `build.bat` provided as emergency local fallback only. Canonical distribution is Actions artifacts / Releases.
 
 **Acceptance test (LOCKED):** The ZIP from the 17-page TIB fixture, unzipped and run through the exe on the user's machine, produces exactly 5 emails received at `cng@stacksbowers.com`, each with subject `123` and the correct attachment filename, and the user's Power Automate flow files all 5 to the correct SharePoint folders.
+
+---
+
+## Decision 12 — DETECTION_FAILED hard flag + parallel detection audit (2026-07-13)
+
+### Context
+
+A self-audit pass was requested after three silent deviations from spec were caught by the user:
+1. SMTP approach proposed without flagging it as a COM deviation (Decision 11)
+2. Render env vars not set before first deploy
+3. Parallel detection retry logic not fully spec-compliant
+
+### Self-audit findings
+
+| # | Spec requirement | Status | Action |
+|---|---|---|---|
+| A | Task 1: "run pages concurrently, 5–10 parallel with retries" | `ThreadPoolExecutor(5)` was present but retry used generic `time.sleep()` without distinguishing 429 from other errors | Fixed: 429-specific exponential backoff (4s, 8s, 16s, 32s, 64s) added |
+| B | Task 1: "API error must never silently become inherited" | **CRITICAL BUG**: `detect_page()` returned `{"candidates": [], "error": "..."}` but `resolve_page()` never checked `detection.error`, so a failed page fell into the empty-page inheritance branch and silently inherited its neighbor's ticket | Fixed: `resolve_page()` now checks `detection.error` first and returns `DETECTION_FAILED` immediately |
+| C | `DETECTION_FAILED` hard flag | Not defined anywhere in `grouping.py` or `HARD_FLAGS` | Fixed: added `FLAG_DETECTION_FAILED` constant, added to `HARD_FLAGS`, added isolation guard in `pages_can_merge()` |
+| D | Sticker retry and second-pass under parallelism | Both run sequentially after the parallel first-pass — correct by design (they depend on first-pass results) | No change needed |
+| E | SMTP approach | Proposed without flagging deviation from COM spec first | Recorded in Decision 11 |
+| F | Render env vars not set on first deploy | Deployment pipeline gap | Fixed manually; documented here |
+
+### DETECTION_FAILED semantics (LOCKED)
+
+- A page whose `detect_page()` call exhausts all retries returns `{"error": "max_retries_exceeded: ..."}`.
+- `resolve_page()` checks `detection.error` **before any other rule** and returns a `ResolvedPage` with `resolved_ticket=None` and `flags=[FLAG_DETECTION_FAILED]`.
+- `build_blocks()` inheritance loop has an explicit guard: `FLAG_DETECTION_FAILED` pages bypass all inheritance branches and are appended as-is.
+- `pages_can_merge()` returns `False` if either page carries `FLAG_DETECTION_FAILED`, so failed pages are always isolated in their own single-page block.
+- `FLAG_DETECTION_FAILED` is in `HARD_FLAGS` — Confirm is blocked until the reviewer manually assigns a ticket to the failed page.
+
+### Parallel detection retry backoff (LOCKED)
+
+- 429/rate-limit: 4s, 8s, 16s, 32s, 64s (`2^(attempt+2)`)
+- 5xx server error: 1s, 2s, 4s, 8s, 16s (standard exponential)
+- All other errors: 1s, 2s, 4s, 8s, 16s (standard exponential)
+- Last error string captured and included in the returned `error` field for diagnostics
+
+### Tests added
+
+7 new tests in `TestDetectionFailed` (Test 21):
+- `test_failed_page_gets_detection_failed_flag`
+- `test_failed_page_is_not_inherited`
+- `test_failed_page_blocks_confirm`
+- `test_failed_page_is_isolated_block`
+- `test_failed_page_in_middle_does_not_break_adjacent_blocks`
+- `test_multiple_failed_pages_each_isolated`
+- `test_clean_batch_has_no_detection_failed`
+
+Total tests: 106 (was 99).

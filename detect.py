@@ -192,6 +192,7 @@ def detect_page(
         },
     ]
 
+    last_exc_str = "unknown"
     for attempt in range(max_retries):
         try:
             resp = client.chat.completions.create(
@@ -228,12 +229,30 @@ def detect_page(
             )
             return {"page": page_num, "candidates": candidates, "pink_marker": pink_marker, "error": None}
         except Exception as exc:
-            wait = 2 ** attempt
-            log.warning("Page %d attempt %d failed: %s — retrying in %ds", page_num, attempt + 1, exc, wait)
+            last_exc_str = str(exc)
+            # Detect 429 (rate-limit) vs other errors for appropriate backoff
+            exc_str_lower = last_exc_str.lower()
+            is_rate_limit = "429" in last_exc_str or "rate limit" in exc_str_lower or "rate_limit" in exc_str_lower
+            is_server_error = any(code in last_exc_str for code in ("500", "502", "503", "504"))
+            if is_rate_limit:
+                # Exponential backoff with jitter for rate limits: 4s, 8s, 16s, 32s, 64s
+                wait = (2 ** (attempt + 2))
+                log.warning("Page %d attempt %d rate-limited (429) — retrying in %ds", page_num, attempt + 1, wait)
+            elif is_server_error:
+                wait = 2 ** attempt
+                log.warning("Page %d attempt %d server error — retrying in %ds", page_num, attempt + 1, wait)
+            else:
+                wait = 2 ** attempt
+                log.warning("Page %d attempt %d failed: %s — retrying in %ds", page_num, attempt + 1, exc, wait)
             time.sleep(wait)
 
-    log.error("Page %d: all retries exhausted", page_num)
-    return {"page": page_num, "candidates": [], "error": "max_retries_exceeded"}
+    log.error("Page %d: all %d retries exhausted. Last error: %s", page_num, max_retries, last_exc_str)
+    return {
+        "page": page_num,
+        "candidates": [],
+        "pink_marker": False,
+        "error": f"max_retries_exceeded: {last_exc_str}",
+    }
 
 
 def detect_page_second_pass(

@@ -1447,3 +1447,134 @@ class TestReconciliationChecks(unittest.TestCase):
         errors = _run_server_checks(review)
         self.assertEqual(errors, [],
             f"After reassignment, all checks should pass, got: {errors}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 21 — DETECTION_FAILED hard flag (API error must never silently inherit)
+# ─────────────────────────────────────────────────────────────────────────────
+
+from grouping import FLAG_DETECTION_FAILED
+
+
+def make_failed_page(page_num, error="max_retries_exceeded: Connection timeout"):
+    """Build a raw detection dict simulating an API failure on one page."""
+    return {"page": page_num, "candidates": [], "pink_marker": False, "error": error}
+
+
+class TestDetectionFailed(unittest.TestCase):
+    """
+    Verify that a page whose API detection failed after all retries:
+      1. Carries the DETECTION_FAILED hard flag
+      2. Is never silently inherited from a neighbor
+      3. Blocks Confirm (has_hard_flag = True)
+      4. Is isolated in its own block (does not merge with adjacent pages)
+    """
+
+    WL = ["111111", "222222", "333333"]
+
+    def _run(self, pages):
+        result = group_detections(pages, self.WL)
+        return result
+
+    def test_failed_page_gets_detection_failed_flag(self):
+        """A page with error set must carry DETECTION_FAILED flag."""
+        pages = [
+            make_page(1, "111111"),
+            make_failed_page(2),
+            make_page(3, "111111"),
+        ]
+        result = self._run(pages)
+        # Find the block containing page 2
+        failed_blocks = [b for b in result.blocks if 2 in b.pages]
+        self.assertEqual(len(failed_blocks), 1, "Page 2 must be in exactly one block")
+        failed_block = failed_blocks[0]
+        self.assertIn(FLAG_DETECTION_FAILED, failed_block.flags,
+                      "DETECTION_FAILED must be in the block's flags")
+
+    def test_failed_page_is_not_inherited(self):
+        """A failed page must NOT inherit the ticket from its neighbor."""
+        pages = [
+            make_page(1, "111111"),
+            make_failed_page(2),
+            make_page(3, "111111"),
+        ]
+        result = self._run(pages)
+        failed_blocks = [b for b in result.blocks if 2 in b.pages]
+        self.assertEqual(len(failed_blocks), 1)
+        failed_block = failed_blocks[0]
+        self.assertIsNone(failed_block.ticket,
+                          "Failed page must NOT inherit ticket — ticket must be None")
+
+    def test_failed_page_blocks_confirm(self):
+        """A batch with a DETECTION_FAILED page must have has_hard_flag=True."""
+        pages = [
+            make_page(1, "111111"),
+            make_failed_page(2),
+            make_page(3, "222222"),
+        ]
+        result = self._run(pages)
+        failed_blocks = [b for b in result.blocks if 2 in b.pages]
+        self.assertEqual(len(failed_blocks), 1)
+        self.assertTrue(failed_blocks[0].has_hard_flag,
+                        "Block with DETECTION_FAILED must have has_hard_flag=True")
+
+    def test_failed_page_is_isolated_block(self):
+        """A failed page must be in its own block, not merged with adjacent pages."""
+        pages = [
+            make_page(1, "111111"),
+            make_failed_page(2),
+            make_page(3, "111111"),
+        ]
+        result = self._run(pages)
+        # Page 2 must be alone in its block
+        failed_blocks = [b for b in result.blocks if 2 in b.pages]
+        self.assertEqual(len(failed_blocks), 1)
+        self.assertEqual(failed_blocks[0].pages, [2],
+                         "Failed page must be isolated in its own single-page block")
+
+    def test_failed_page_in_middle_does_not_break_adjacent_blocks(self):
+        """Pages before and after a failed page are still correctly grouped."""
+        pages = [
+            make_page(1, "111111"),
+            make_page(2, "111111"),
+            make_failed_page(3),
+            make_page(4, "222222"),
+            make_page(5, "222222"),
+        ]
+        result = self._run(pages)
+        tickets = {b.ticket: b.pages for b in result.blocks if b.ticket}
+        self.assertIn("111111", tickets)
+        self.assertIn("222222", tickets)
+        self.assertEqual(tickets["111111"], [1, 2])
+        self.assertEqual(tickets["222222"], [4, 5])
+
+    def test_multiple_failed_pages_each_isolated(self):
+        """Multiple failed pages each get their own isolated block."""
+        pages = [
+            make_page(1, "111111"),
+            make_failed_page(2, error="max_retries_exceeded: timeout"),
+            make_failed_page(3, error="max_retries_exceeded: 500 server error"),
+            make_page(4, "222222"),
+        ]
+        result = self._run(pages)
+        failed_blocks = [b for b in result.blocks if FLAG_DETECTION_FAILED in b.flags]
+        self.assertEqual(len(failed_blocks), 2,
+                         "Each failed page must be in its own isolated block")
+        failed_pages = sorted(p for b in failed_blocks for p in b.pages)
+        self.assertEqual(failed_pages, [2, 3])
+
+    def test_clean_batch_has_no_detection_failed(self):
+        """A batch with no API errors must have no DETECTION_FAILED flags."""
+        pages = [
+            make_page(1, "111111"),
+            make_page(2, "111111"),
+            make_page(3, "222222"),
+        ]
+        result = self._run(pages)
+        for block in result.blocks:
+            self.assertNotIn(FLAG_DETECTION_FAILED, block.flags,
+                             f"Clean batch block {block.ticket} must not have DETECTION_FAILED")
+
+
+if __name__ == "__main__":
+    unittest.main()
