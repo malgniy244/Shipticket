@@ -1,7 +1,12 @@
 """
 detect.py — Task 1: Detection module
-Renders each PDF page to JPEG at 150 DPI, sends to OpenAI vision model,
+Renders each PDF page to JPEG at 150 DPI, sends to vision model,
 returns structured per-page detection results with checkpointing.
+
+Model: gemini-3-flash-preview (switched from gpt-5 per Decision 13 — gpt-5 is a
+reasoning model that consumed its token budget on reasoning before producing output,
+causing 400 max_tokens errors and ~12s/page latency. Gemini Flash is a fast
+multimodal vision model: 4.8s/page, 100% detection accuracy on all tested fixtures.)
 
 Second-pass logic: when a page has no detection AND it is the first page of
 the document (or would become ORPHAN_LEADING_PAGES), the module re-queries
@@ -9,6 +14,12 @@ the vision model with the whitelist included in the prompt, asking whether
 any of those specific numbers appear on the page. A hit is treated as a
 normal detection carrying a soft SECOND_PASS flag visible in the review screen.
 This can only return whitelist members, so no matching rule is loosened.
+
+DETECTION_FAILED semantics (Decision 12):
+All three detection paths (first-pass, sticker-retry, second-pass) set
+result["error"] on exhaustion. The grouping engine converts this to a
+DETECTION_FAILED hard flag that blocks Confirm until manually resolved.
+A failed page is NEVER silently inherited.
 
 Usage:
     python3 detect.py <pdf_path> [--checkpoint <json_path>] [--workers <n>]
@@ -36,7 +47,22 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Vision model ──────────────────────────────────────────────────────────────
-DEFAULT_MODEL = "gpt-5"  # Best vision accuracy for messy handwriting
+# Decision 13: switched from gpt-5 (reasoning model, ~12s/page, 82% accuracy,
+# 400 max_tokens errors) to gemini-3-flash-preview (fast multimodal vision,
+# ~4.8s/page, 100% accuracy on all tested fixtures, no reasoning token budget issue).
+DEFAULT_MODEL = "gemini-3-flash-preview"
+
+# ── Token budget per model family ─────────────────────────────────────────────
+# GPT models use max_completion_tokens; Gemini uses max_tokens.
+# Reasoning models (gpt-5 series) consume reasoning tokens from this budget —
+# use a larger value to avoid 400 errors. Non-reasoning models need much less.
+def _max_tokens_kwarg(model: str, budget: int) -> dict:
+    """Return the correct token-limit kwarg for the given model."""
+    if model.startswith("gpt-") or model.startswith("o"):
+        return {"max_completion_tokens": budget}
+    else:
+        return {"max_tokens": budget}
+
 
 # ── JSON schema for structured output ────────────────────────────────────────
 CANDIDATE_SCHEMA = {
@@ -167,7 +193,11 @@ def detect_page(
     model: str = DEFAULT_MODEL,
     max_retries: int = 5,
 ) -> dict:
-    """Send one page image to the vision model and return structured detection result."""
+    """Send one page image to the vision model and return structured detection result.
+
+    On exhaustion, returns {"page": page_num, "candidates": [], "pink_marker": False,
+    "error": "max_retries_exceeded: ..."} — never silently becomes an inherited page.
+    """
     b64 = base64.b64encode(jpeg_bytes).decode("ascii")
     data_url = f"data:image/jpeg;base64,{b64}"
 
@@ -206,9 +236,11 @@ def detect_page(
                         "schema": PAGE_RESULT_SCHEMA,
                     },
                 },
-                max_completion_tokens=1024,
+                **_max_tokens_kwarg(model, 4096),
             )
             raw = resp.choices[0].message.content
+            if not raw or not raw.strip():
+                raise ValueError("empty response body from model")
             result = json.loads(raw)
             # Ensure second_pass=False on all first-pass candidates
             for c in result.get("candidates", []):
@@ -270,6 +302,9 @@ def detect_page_second_pass(
 
     Returns a candidate dict with second_pass=True if a whitelist member is found,
     or None if still no match.
+
+    On exhaustion, returns a sentinel dict with error="second_pass_exhausted: ..."
+    so the caller can set the page error field and trigger DETECTION_FAILED.
     """
     b64 = base64.b64encode(jpeg_bytes).decode("ascii")
     data_url = f"data:image/jpeg;base64,{b64}"
@@ -300,6 +335,7 @@ def detect_page_second_pass(
         },
     ]
 
+    last_exc_str = "unknown"
     for attempt in range(max_retries):
         try:
             resp = client.chat.completions.create(
@@ -313,9 +349,11 @@ def detect_page_second_pass(
                         "schema": SECOND_PASS_SCHEMA,
                     },
                 },
-                max_completion_tokens=256,
+                **_max_tokens_kwarg(model, 1024),
             )
             raw = resp.choices[0].message.content
+            if not raw or not raw.strip():
+                raise ValueError("empty response body from model")
             result = json.loads(raw)
             matched = result.get("matched_ticket")
             if matched and matched in whitelist:
@@ -337,12 +375,14 @@ def detect_page_second_pass(
                 log.info("Page %d second-pass: no whitelist match found", page_num)
                 return None
         except Exception as exc:
+            last_exc_str = str(exc)
             wait = 2 ** attempt
             log.warning("Page %d second-pass attempt %d failed: %s — retrying in %ds", page_num, attempt + 1, exc, wait)
             time.sleep(wait)
 
-    log.error("Page %d: second-pass all retries exhausted", page_num)
-    return None
+    log.error("Page %d: second-pass all %d retries exhausted. Last error: %s", page_num, max_retries, last_exc_str)
+    # Return sentinel — caller must set results[pn]["error"] to trigger DETECTION_FAILED
+    return {"_exhausted": True, "error": f"second_pass_exhausted: {last_exc_str}"}
 
 
 def detect_page_sticker_retry(
@@ -351,15 +391,19 @@ def detect_page_sticker_retry(
     jpeg_bytes: bytes,
     model: str = DEFAULT_MODEL,
     max_retries: int = 3,
-) -> list[dict]:
+) -> list[dict] | dict:
     """
     Sticker-focused retry for a page that returned no candidates on the first pass.
     Uses a prompt that explicitly focuses on the white rectangular label sticker
     and instructs the model to ignore banknote serials, grade numbers, and other
     numeric content that is not the ship ticket number.
 
-    Returns a list of candidate dicts (may be empty), each with second_pass=False
-    (this is a first-pass retry, not a whitelist-context second pass).
+    Returns:
+    - list of candidate dicts (may be empty) on success
+    - {"_exhausted": True, "error": "sticker_retry_exhausted: ..."} on exhaustion
+
+    The caller must check for _exhausted and set results[pn]["error"] to trigger
+    DETECTION_FAILED (Decision 12).
     """
     b64 = base64.b64encode(jpeg_bytes).decode("ascii")
     data_url = f"data:image/jpeg;base64,{b64}"
@@ -385,6 +429,7 @@ def detect_page_sticker_retry(
         },
     ]
 
+    last_exc_str = "unknown"
     for attempt in range(max_retries):
         try:
             resp = client.chat.completions.create(
@@ -398,9 +443,11 @@ def detect_page_sticker_retry(
                         "schema": PAGE_RESULT_SCHEMA,
                     },
                 },
-                max_completion_tokens=512,
+                **_max_tokens_kwarg(model, 2048),
             )
             raw = resp.choices[0].message.content
+            if not raw or not raw.strip():
+                raise ValueError("empty response body from model")
             result = json.loads(raw)
             candidates = result.get("candidates", [])
             # Ensure second_pass=False (this is a retry, not a whitelist-context pass)
@@ -414,6 +461,7 @@ def detect_page_sticker_retry(
             )
             return candidates
         except Exception as exc:
+            last_exc_str = str(exc)
             wait = 2 ** attempt
             log.warning(
                 "Page %d sticker-retry attempt %d failed: %s — retrying in %ds",
@@ -421,8 +469,8 @@ def detect_page_sticker_retry(
             )
             time.sleep(wait)
 
-    log.error("Page %d: sticker-retry all retries exhausted", page_num)
-    return []
+    log.error("Page %d: sticker-retry all %d retries exhausted. Last error: %s", page_num, max_retries, last_exc_str)
+    return {"_exhausted": True, "error": f"sticker_retry_exhausted: {last_exc_str}"}
 
 
 def run_detection(
@@ -440,6 +488,9 @@ def run_detection(
     Checkpoints results incrementally to checkpoint_path (JSON).
     force_pages: if set, re-run only these 1-indexed page numbers regardless of checkpoint.
     whitelist: if provided, enables second-pass detection for orphan-candidate pages.
+
+    Sticker-retry runs concurrently (same concurrency pool as first-pass, per Decision 13).
+    All three detection paths set result["error"] on exhaustion (Decision 12).
     """
     client = OpenAI()  # reads OPENAI_API_KEY and OPENAI_API_BASE from env
 
@@ -478,6 +529,7 @@ def run_detection(
             with open(checkpoint_path, "w") as f:
                 json.dump(list(results.values()), f, indent=2)
 
+    # ── First-pass: concurrent detection ──────────────────────────────────────
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
             executor.submit(detect_page, client, pn, page_images[pn], model): pn
@@ -489,21 +541,29 @@ def run_detection(
                 result = future.result()
             except Exception as exc:
                 log.error("Page %d unexpected error: %s", pn, exc)
-                result = {"page": pn, "candidates": [], "error": str(exc)}
+                result = {
+                    "page": pn,
+                    "candidates": [],
+                    "pink_marker": False,
+                    "error": f"unexpected_error: {exc}",
+                }
             results[pn] = result
             save_checkpoint()
             log.info("Progress: %d / %d pages done", len(results), total_pages)
 
-    # ── Sticker retry for any page that returned no candidates ─────────────────
+    # ── Sticker retry: concurrent (Decision 13 — was sequential, now concurrent) ──
     # After first-pass completes, retry any empty page with the sticker-focused
     # prompt. This catches pages where the first-pass prompt was confused by
     # dense numeric content (banknote serials, grade numbers, etc.) and missed
-    # the white label sticker. This retry runs on ALL empty pages, not just
-    # orphan-candidate pages.
-    empty_pages = [pn for pn in pending if not results[pn].get("candidates")]
+    # the white label sticker. Runs on ALL empty pages that don't already have
+    # an error (errored pages get DETECTION_FAILED, not a retry).
+    empty_pages = [
+        pn for pn in pending
+        if not results[pn].get("candidates") and not results[pn].get("error")
+    ]
     if empty_pages:
         log.info(
-            "Running sticker-retry on %d empty pages: %s",
+            "Running concurrent sticker-retry on %d empty pages: %s",
             len(empty_pages), empty_pages,
         )
         # Ensure all empty pages are rendered
@@ -514,11 +574,27 @@ def run_detection(
                 page_images[pn] = render_page_to_jpeg(doc_retry, pn - 1, dpi=dpi)
             doc_retry.close()
 
-        for pn in empty_pages:
-            retry_candidates = detect_page_sticker_retry(client, pn, page_images[pn], model)
-            if retry_candidates:
-                results[pn]["candidates"] = retry_candidates
-                # pink_marker is already in results[pn] from the first pass; preserve it
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            retry_futures = {
+                executor.submit(detect_page_sticker_retry, client, pn, page_images[pn], model): pn
+                for pn in empty_pages
+            }
+            for future in as_completed(retry_futures):
+                pn = retry_futures[future]
+                try:
+                    retry_result = future.result()
+                except Exception as exc:
+                    log.error("Page %d sticker-retry unexpected error: %s", pn, exc)
+                    retry_result = {"_exhausted": True, "error": f"sticker_retry_unexpected: {exc}"}
+
+                if isinstance(retry_result, dict) and retry_result.get("_exhausted"):
+                    # Exhaustion — set error field so DETECTION_FAILED fires in grouping
+                    results[pn]["error"] = retry_result["error"]
+                    log.error("Page %d sticker-retry exhausted → DETECTION_FAILED", pn)
+                elif retry_result:
+                    results[pn]["candidates"] = retry_result
+                    # pink_marker is already in results[pn] from the first pass; preserve it
+                # else: empty list — page stays empty, will be inherited normally
                 save_checkpoint()
 
     # ── Second-pass for orphan-candidate pages ────────────────────────────────
@@ -537,10 +613,10 @@ def run_detection(
             list(range(1, first_detected_idx + 1)) if first_detected_idx is not None
             else list(range(1, total_pages + 1))
         )
-        # Only run second pass on pages that had no candidates
+        # Only run second pass on pages that had no candidates and no error
         second_pass_pages = [
             p for p in orphan_candidate_pages
-            if not results[p].get("candidates")
+            if not results[p].get("candidates") and not results[p].get("error")
         ]
         if second_pass_pages:
             log.info(
@@ -548,26 +624,24 @@ def run_detection(
                 len(second_pass_pages), second_pass_pages,
             )
             # Render pages if not already in page_images (e.g. loaded from checkpoint)
-            if not page_images:
+            missing_renders = [p for p in second_pass_pages if p not in page_images]
+            if missing_renders:
                 doc2 = fitz.open(pdf_path)
-                for pn in second_pass_pages:
-                    if pn not in page_images:
-                        page_images[pn] = render_page_to_jpeg(doc2, pn - 1, dpi=dpi)
+                for pn in missing_renders:
+                    page_images[pn] = render_page_to_jpeg(doc2, pn - 1, dpi=dpi)
                 doc2.close()
-            else:
-                # Some pages may not be in page_images if they came from checkpoint
-                missing_renders = [p for p in second_pass_pages if p not in page_images]
-                if missing_renders:
-                    doc2 = fitz.open(pdf_path)
-                    for pn in missing_renders:
-                        page_images[pn] = render_page_to_jpeg(doc2, pn - 1, dpi=dpi)
-                    doc2.close()
 
             for pn in second_pass_pages:
                 candidate = detect_page_second_pass(
                     client, pn, page_images[pn], whitelist, model
                 )
-                if candidate:
+                if candidate is None:
+                    pass  # No match found — normal, page will be inherited
+                elif isinstance(candidate, dict) and candidate.get("_exhausted"):
+                    # Exhaustion — set error field so DETECTION_FAILED fires in grouping
+                    results[pn]["error"] = candidate["error"]
+                    log.error("Page %d second-pass exhausted → DETECTION_FAILED", pn)
+                else:
                     results[pn]["candidates"] = [candidate]
                     save_checkpoint()
 
@@ -589,6 +663,7 @@ def run_detection(
         unmatched_pages = [
             pn for pn in range(1, total_pages + 1)
             if results[pn].get("candidates") and not has_whitelist_match(results[pn])
+            and not results[pn].get("error")
         ]
         if unmatched_pages:
             log.info(
@@ -607,11 +682,264 @@ def run_detection(
                 candidate = detect_page_second_pass(
                     client, pn, page_images[pn], whitelist, model
                 )
-                if candidate:
+                if candidate is None:
+                    pass
+                elif isinstance(candidate, dict) and candidate.get("_exhausted"):
+                    results[pn]["error"] = candidate["error"]
+                    log.error("Page %d UNMATCHED second-pass exhausted → DETECTION_FAILED", pn)
+                else:
                     # Inject as additional candidate — grouping engine will prefer it
                     # via the SECOND_PASS flag and resolve_page logic
                     results[pn]["candidates"].append(candidate)
                     save_checkpoint()
+
+    # Return sorted by page number
+    return [results[i + 1] for i in range(total_pages)]
+
+
+def run_detection_fast(
+    pdf_path: str,
+    pre_boundaries: list[int],
+    checkpoint_path: str | None = None,
+    workers: int = 5,
+    model: str = DEFAULT_MODEL,
+    dpi: int = 150,
+    whitelist: list[str] | None = None,
+) -> list[dict]:
+    """
+    Fast mode detection: lazy identification using local pink sticker boundaries.
+
+    For each block defined by pre_boundaries (1-indexed page numbers that start
+    a new block), only the first page of each block is sent to the vision API.
+    If the first page resolves to a whitelist ticket, inner pages are marked as
+    not_read and skipped. If unresolved, pages are read progressively until
+    resolved or the block is exhausted.
+
+    pre_boundaries: list of page numbers (1-indexed) that are block starts,
+        as detected by local pink sticker detection. Page 1 is always included.
+    whitelist: if provided, enables second-pass detection for orphan-candidate pages.
+
+    Returns the same format as run_detection() but with not_read pages included.
+    DETECTION_FAILED semantics are unchanged for pages that are actually read.
+    """
+    from pink_detect import detect_pink_sticker  # local, no API
+
+    client = OpenAI()
+
+    # Load checkpoint if it exists
+    checkpoint: dict[int, dict] = {}
+    if checkpoint_path and Path(checkpoint_path).exists():
+        with open(checkpoint_path) as f:
+            saved = json.load(f)
+        checkpoint = {r["page"]: r for r in saved}
+        log.info("[fast] Loaded checkpoint with %d pages already done", len(checkpoint))
+
+    doc = fitz.open(pdf_path)
+    total_pages = len(doc)
+    log.info("[fast] PDF has %d pages, pre_boundaries=%s", total_pages, pre_boundaries)
+
+    # Ensure page 1 is always a block start
+    boundaries = sorted(set([1] + [p for p in pre_boundaries if 1 <= p <= total_pages]))
+
+    # Build block ranges: [(start, end), ...] (inclusive, 1-indexed)
+    block_ranges: list[tuple[int, int]] = []
+    for i, start in enumerate(boundaries):
+        end = boundaries[i + 1] - 1 if i + 1 < len(boundaries) else total_pages
+        block_ranges.append((start, end))
+    log.info("[fast] %d blocks: %s", len(block_ranges), block_ranges)
+
+    # Render all pages (fast, local)
+    page_images: dict[int, bytes] = {}
+    for page_num in range(1, total_pages + 1):
+        page_images[page_num] = render_page_to_jpeg(doc, page_num - 1, dpi=dpi)
+    doc.close()
+
+    results: dict[int, dict] = dict(checkpoint)
+
+    def save_checkpoint():
+        if checkpoint_path:
+            with open(checkpoint_path, "w") as f:
+                json.dump(list(results.values()), f, indent=2)
+
+    def is_resolved(page_result: dict) -> bool:
+        """Return True if the page has at least one valid candidate."""
+        return bool(page_result.get("candidates"))
+
+    def is_whitelist_resolved(page_result: dict, wl: list[str]) -> bool:
+        """Return True if any candidate value is in the whitelist."""
+        if not wl:
+            return is_resolved(page_result)
+        for c in page_result.get("candidates", []):
+            if c.get("value") in wl:
+                return True
+        return False
+
+    # ── Determine which pages need to be read (lazy identification) ──
+    pages_to_read: list[int] = []  # pages that will be sent to the API
+    not_read_pages: set[int] = set()  # pages that will be skipped
+
+    for start, end in block_ranges:
+        if end < start:
+            continue
+        # Always read the first page of each block
+        first_page = start
+        pages_to_read.append(first_page)
+        # Inner pages: tentatively mark as not_read; will be promoted if first page fails
+        for p in range(start + 1, end + 1):
+            not_read_pages.add(p)
+
+    # Skip pages already in checkpoint (unless they are not_read markers)
+    pending_read = [
+        p for p in pages_to_read
+        if p not in checkpoint or checkpoint[p].get("not_read", False)
+    ]
+    log.info("[fast] %d first-pages to read via API: %s", len(pending_read), pending_read)
+
+    # ── First-pass: concurrent detection on first pages only ──
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(detect_page, client, pn, page_images[pn], model): pn
+            for pn in pending_read
+        }
+        for future in as_completed(futures):
+            pn = futures[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                log.error("[fast] Page %d unexpected error: %s", pn, exc)
+                result = {
+                    "page": pn,
+                    "candidates": [],
+                    "pink_marker": False,
+                    "error": f"unexpected_error: {exc}",
+                }
+            results[pn] = result
+            save_checkpoint()
+
+    # ── Progressive fallback: for unresolved first pages, read inner pages ──
+    # For each block where the first page is unresolved (no whitelist match),
+    # read inner pages one by one until resolved or block exhausted.
+    progressive_pages: list[int] = []
+    for start, end in block_ranges:
+        if end <= start:
+            continue
+        first_result = results.get(start, {})
+        if first_result.get("error"):
+            # DETECTION_FAILED on first page — don't read inner pages
+            log.info("[fast] Block %d-%d: first page DETECTION_FAILED, skipping inner pages", start, end)
+            continue
+        if is_whitelist_resolved(first_result, whitelist or []):
+            # First page resolved — inner pages stay not_read
+            log.info("[fast] Block %d-%d: first page resolved, %d inner pages skipped", start, end, end - start)
+            continue
+        # First page unresolved — read inner pages progressively
+        log.info("[fast] Block %d-%d: first page unresolved, reading inner pages", start, end)
+        for p in range(start + 1, end + 1):
+            progressive_pages.append(p)
+            not_read_pages.discard(p)  # promote from not_read to pending
+
+    if progressive_pages:
+        log.info("[fast] Progressive fallback: reading %d inner pages: %s", len(progressive_pages), progressive_pages)
+        # Filter out already-checkpointed pages
+        pending_progressive = [p for p in progressive_pages if p not in checkpoint]
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(detect_page, client, pn, page_images[pn], model): pn
+                for pn in pending_progressive
+            }
+            for future in as_completed(futures):
+                pn = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    log.error("[fast] Page %d progressive unexpected error: %s", pn, exc)
+                    result = {
+                        "page": pn,
+                        "candidates": [],
+                        "pink_marker": False,
+                        "error": f"unexpected_error: {exc}",
+                    }
+                results[pn] = result
+                save_checkpoint()
+
+    # ── Sticker retry: concurrent on read pages that are still empty ──
+    read_pages = set(pages_to_read) | set(progressive_pages)
+    empty_read_pages = [
+        pn for pn in read_pages
+        if pn in results and not results[pn].get("candidates") and not results[pn].get("error")
+    ]
+    if empty_read_pages:
+        log.info("[fast] Sticker-retry on %d empty read pages: %s", len(empty_read_pages), empty_read_pages)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            retry_futures = {
+                executor.submit(detect_page_sticker_retry, client, pn, page_images[pn], model): pn
+                for pn in empty_read_pages
+            }
+            for future in as_completed(retry_futures):
+                pn = retry_futures[future]
+                try:
+                    retry_result = future.result()
+                except Exception as exc:
+                    log.error("[fast] Page %d sticker-retry unexpected error: %s", pn, exc)
+                    retry_result = {"_exhausted": True, "error": f"sticker_retry_unexpected: {exc}"}
+
+                if isinstance(retry_result, dict) and retry_result.get("_exhausted"):
+                    results[pn]["error"] = retry_result["error"]
+                    log.error("[fast] Page %d sticker-retry exhausted → DETECTION_FAILED", pn)
+                elif retry_result:
+                    results[pn]["candidates"] = retry_result
+                save_checkpoint()
+
+    # ── Second-pass for orphan-candidate read pages ──
+    if whitelist:
+        sorted_read = sorted(read_pages)
+        first_detected_idx = next(
+            (i for i, pn in enumerate(sorted_read) if results.get(pn, {}).get("candidates")),
+            None,
+        )
+        if first_detected_idx is not None:
+            orphan_read = sorted_read[:first_detected_idx]
+        else:
+            orphan_read = sorted_read
+        second_pass_pages = [
+            p for p in orphan_read
+            if not results.get(p, {}).get("candidates") and not results.get(p, {}).get("error")
+        ]
+        if second_pass_pages:
+            log.info("[fast] Second-pass on %d orphan read pages: %s", len(second_pass_pages), second_pass_pages)
+            for pn in second_pass_pages:
+                candidate = detect_page_second_pass(client, pn, page_images[pn], whitelist, model)
+                if candidate is None:
+                    pass
+                elif isinstance(candidate, dict) and candidate.get("_exhausted"):
+                    results[pn]["error"] = candidate["error"]
+                    log.error("[fast] Page %d second-pass exhausted → DETECTION_FAILED", pn)
+                else:
+                    results[pn]["candidates"] = [candidate]
+                    save_checkpoint()
+
+    # ── Fill not_read pages into results ──
+    for pn in not_read_pages:
+        if pn not in results:
+            results[pn] = {
+                "page": pn,
+                "candidates": [],
+                "pink_marker": False,
+                "error": None,
+                "not_read": True,
+            }
+            log.info("[fast] Page %d marked as not_read", pn)
+
+    # Ensure all pages are in results (safety net)
+    for pn in range(1, total_pages + 1):
+        if pn not in results:
+            log.warning("[fast] Page %d missing from results — adding empty", pn)
+            results[pn] = {"page": pn, "candidates": [], "pink_marker": False, "error": None}
+
+    log.info(
+        "[fast] Done: %d total pages, %d read, %d not_read",
+        total_pages, len(read_pages), len(not_read_pages),
+    )
 
     # Return sorted by page number
     return [results[i + 1] for i in range(total_pages)]
@@ -659,7 +987,6 @@ def main():
     if args.output:
         with open(args.output, "w") as f:
             f.write(output)
-        log.info("Results written to %s", args.output)
     else:
         print(output)
 

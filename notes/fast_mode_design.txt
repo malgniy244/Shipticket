@@ -1,0 +1,91 @@
+Fast Mode Design Spec — 2026-07-13
+===================================
+
+Overview
+--------
+Fast mode reduces API calls by using local pink detection for boundaries and
+lazy (first-page-only) identification for each block.
+
+Trigger
+-------
+- Selectable at job creation via fast_mode toggle (default ON for non_tib batches)
+- Full mode remains available and is the default for tib batches
+- Stored on job dict as fast_mode: bool
+
+Fast Mode Pipeline (non-TIB)
+-----------------------------
+1. LOCAL PINK DETECTION (no API, milliseconds):
+   - Render all pages at 150 DPI (same as full mode)
+   - Run detect_pink_sticker() on each page
+   - Pink pages become block boundary candidates
+   - These set block starts BEFORE any API calls
+
+2. LAZY IDENTIFICATION (API on first page of each block only):
+   - For each block's first page: run full detect_page() (first-pass)
+   - If first page resolves to a whitelist ticket (exact or valid fuzzy):
+     → Block is identified; inner pages are NOT sent to API
+     → Inner pages stored as "not_read" in detection_results
+   - If first page is unresolved (no candidates or UNMATCHED):
+     → Progressive read: continue page by page into the block
+     → Stop when resolved or block exhausted
+   - If first page has DETECTION_FAILED:
+     → Hard flag fires immediately; block is not identified
+     → Inner pages still not read (no point reading them)
+
+3. STICKER RETRY / SECOND PASS:
+   - Only run on pages that were actually read (not "not_read")
+   - Same concurrent logic as full mode
+
+4. SAFETY BACKSTOP:
+   - Reconciliation checks unchanged: MISSING_TICKET blocks download
+   - A forgotten sticker = no boundary = pages merged into wrong block
+     → Wrong ticket in reconciliation → MISSING_TICKET or EXTRA_TICKET
+   - DETECTION_FAILED semantics unchanged for read pages
+
+Not-Read Pages
+--------------
+- detection_results entry: {"page": N, "candidates": [], "not_read": True}
+- grouping engine: not_read pages are treated as inherited (no candidates)
+  but carry a soft NOT_READ flag (not a hard flag — does not block confirm)
+- filmstrip: source = "not read (fast mode)" displayed in grey
+- Phase B: not_read pages shown with grey "not read" badge in filmstrip
+- On-demand scan: existing /page/{page}/second-pass endpoint works on not_read pages
+  The frontend shows a "Scan this page" button for not_read pages
+
+Grouping Integration
+--------------------
+- Pink boundaries from local detection are passed to group_detections() as
+  pre_boundaries: list[int] (page numbers that are forced block starts)
+- group_detections() uses pre_boundaries alongside detection-based boundaries
+- repool_from_boundaries() also accepts pre_boundaries
+
+Frontend Changes
+----------------
+- Job creation form: fast_mode checkbox (default checked for non_tib)
+- Phase B filmstrip: grey "not read" badge for not_read pages
+- Phase B: "Scan this page" button on not_read pages (calls on-demand endpoint)
+
+Tests Required
+--------------
+1. Forgotten sticker → MISSING_TICKET blocks download
+2. First-page-resolves → inner pages skipped (not_read=True)
+3. First-page-unresolved → progressive read until resolved
+4. Pink detection unit tests on fixture #6 pages 1,4,8,11,14
+5. DETECTION_FAILED on first page → block unidentified, inner pages not_read
+
+Backend Changes
+---------------
+- detect.py: add run_detection_fast() function
+  - Takes pre_boundaries (from pink detection) as input
+  - Implements lazy identification per block
+  - Returns same format as run_detection() but with not_read pages
+- main.py:
+  - make_job(): add fast_mode field
+  - create_job(): accept fast_mode form param
+  - run_detection_background(): branch on fast_mode
+  - build_review_state(): handle not_read source display
+  - on_demand_second_pass(): already works, just needs not_read check
+- grouping.py:
+  - group_detections(): accept pre_boundaries param
+  - FLAG_NOT_READ: new soft flag constant
+  - resolve_page(): not_read pages → inherited with NOT_READ flag

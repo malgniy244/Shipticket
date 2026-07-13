@@ -271,3 +271,60 @@ A self-audit pass was requested after three silent deviations from spec were cau
 - `test_clean_batch_has_no_detection_failed`
 
 Total tests: 106 (was 99).
+
+---
+
+## Decision 14 — Fast Mode: local pink detection + lazy identification (2026-07-13)
+
+### Context
+
+Full-mode detection reads every page via the vision API, costing ~4.8s/page. For a 17-page non-TIB batch this is ~82s. The user requested a fast mode that uses local pink sticker detection (no API, milliseconds) to set block boundaries, then only calls the API on the first page of each block. If the first page resolves, inner pages are skipped entirely. This reduces API calls from N pages to K blocks (where K << N for typical batches).
+
+### Design
+
+| Component | Full mode | Fast mode |
+|---|---|---|
+| Boundary discovery | API `pink_marker` field per page | Local OpenCV HSV detection (`pink_detect.py`) |
+| API calls | All N pages | First page of each block only |
+| Unresolved first page | N/A | Progressive fallback: read inner pages until resolved |
+| Sticker retry | All empty pages | Only pages that were actually read |
+| Second-pass | Orphan + UNMATCHED pages | Only read pages that are orphan candidates |
+| Safety backstop | Reconciliation checks | Unchanged — MISSING_TICKET still blocks download |
+
+### not_read page semantics (LOCKED)
+
+- A page skipped by lazy identification is stored in detection results as `{"page": N, "candidates": [], "not_read": True}`.
+- `group_detections()` parses `not_read=True` and sets `PageDetection.not_read = True`.
+- `resolve_page()` checks `detection.not_read` **before the error guard** and returns `ResolvedPage` with `flags=[FLAG_NOT_READ]` and `resolved_ticket=None`.
+- `build_blocks()` has an explicit branch for `FLAG_NOT_READ` pages: they inherit the ticket from the previous block (like empty pages) but keep `FLAG_NOT_READ` in their flags.
+- `FLAG_NOT_READ` is a **soft flag** — it is NOT in `HARD_FLAGS` and does NOT block Confirm.
+- not_read pages before the first detection additionally receive `FLAG_ORPHAN_LEADING_PAGES`.
+- The UI shows `"not read (fast mode)"` source badge (green dashed) for not_read pages in Phase B and the filmstrip.
+- A "Scan this page" button on not_read pages calls the existing `/page/{page}/second-pass` endpoint on demand.
+
+### Forgotten sticker safety backstop (LOCKED)
+
+If a pink sticker is missed (no boundary detected), the pages that should start a new block are absorbed into the previous block. The missing ticket is never assigned to any block, so it appears in `missing_tickets` and the reconciliation check fails. The user cannot download the ZIP until the boundary is corrected manually.
+
+### Frontend changes
+
+- Job creation form: fast_mode checkbox (default checked when non-TIB is selected).
+- `HARD_FLAGS` JS array updated to include `DETECTION_FAILED` (was missing).
+- `SOFT_FLAGS` JS array updated to include `NOT_READ`.
+- `flagLabel()` updated with human-readable labels for both new flags.
+- `srcClass()` updated with `not_read` → `src-not-read` (green dashed badge).
+- Phase B source line: shows per-page source from `reviewState.per_page[page]` instead of block-level `detection_sources`.
+- Filmstrip page info: shows not_read badge and source badge per page.
+
+### Tests added
+
+7 new tests in `TestFastModeNotRead` (Test 22):
+- `test_not_read_page_inherits_ticket`
+- `test_not_read_page_carries_flag`
+- `test_not_read_flag_is_soft_not_hard`
+- `test_not_read_does_not_block_confirm`
+- `test_forgotten_sticker_causes_missing_ticket`
+- `test_detection_failed_on_first_page_inner_pages_not_read`
+- `test_not_read_pages_before_first_detection_get_orphan_flag`
+
+Total tests: 113 (was 106).

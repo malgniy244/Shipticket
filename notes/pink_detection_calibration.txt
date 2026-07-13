@@ -1,0 +1,42 @@
+Pink sticker detection calibration — 2026-07-13
+===============================================
+
+Fixture: SKM_C250i26070917180.pdf (17 pages)
+
+Sticker color (actual pixel values):
+- HSV (OpenCV 0-180 scale): H≈154-168 (mean≈159-160), S≈77, V≈254
+- This is a LIGHT/PASTEL PINK color
+- OpenCV H=159 ≈ 318° in standard HSV = magenta-pink
+- Low saturation (77/255) = pastel, not vivid
+
+Calibrated HSV thresholds (pink_detect.py):
+- Lower1: [140, 50, 100]  Upper1: [180, 255, 255]  (main pink/magenta range)
+- Lower2: [0, 80, 100]    Upper2: [15, 255, 255]   (red-pink wrap-around)
+- Min area: 2000 px² at 150 DPI
+- Min fill ratio: 0.3
+
+Detection results after calibration:
+- Page 1:  YES — pink sticker visible bottom-right (ticket 248258 printed form)
+- Page 4:  YES — pink sticker visible bottom-right
+- Page 8:  YES — pink sticker visible bottom-right
+- Page 11: YES — pink sticker visible bottom-right (ticket 248260 printed form)
+- Page 14: YES — pink sticker visible bottom-right
+
+Pages with NO sticker (confirmed visually):
+- Pages 2, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16, 17
+
+Vision model (gemini-3-flash-preview) PINK_MARKER flags from earlier run:
+- Flagged: pages 4, 5, 6, 15, 16 — PARTIALLY WRONG (5, 6, 15, 16 have no sticker)
+- Missed: pages 1, 8, 11, 14 — WRONG (all have stickers)
+- Conclusion: local OpenCV detection is MORE ACCURATE than vision model for pink stickers
+
+Ground truth for fixture #6 (this file):
+- 5 sticker pages: 1, 4, 8, 11, 14
+- These should be block boundaries in non-TIB mode
+- Ticket numbers: TBD (waiting for user to provide ground truth page map)
+
+Fast mode boundary logic for non-TIB:
+- Block starts at each pink-sticker page
+- Vision API called on block first page only
+- If first page resolves to whitelist ticket → block identified, inner pages skipped
+- If first page unresolved → progressive read into block

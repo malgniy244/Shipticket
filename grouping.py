@@ -50,6 +50,7 @@ FLAG_INHERITED_UNMATCHED = "INHERITED_UNMATCHED"  # soft: unmatched page inherit
 FLAG_NO_PRINTED_COVER = "NO_PRINTED_COVER"       # soft (TIB only): block start not a printed cover
 FLAG_PINK_MARKER = "PINK_MARKER"                 # soft (non-TIB): boundary signal page
 FLAG_DETECTION_FAILED = "DETECTION_FAILED"       # hard: API error after all retries — must not inherit
+FLAG_NOT_READ = "NOT_READ"                       # soft (fast mode): page skipped by lazy identification
 
 # Hard flags that block Confirm until resolved
 HARD_FLAGS = {FLAG_UNMATCHED_NUMBER, FLAG_AMBIGUOUS_SUFFIX, FLAG_AMBIGUOUS_MATCH,
@@ -77,6 +78,7 @@ class PageDetection:
     page: int            # 1-indexed
     candidates: list[Candidate]
     error: Optional[str] = None
+    not_read: bool = False  # Fast mode: page was skipped by lazy identification
 
 
 @dataclass
@@ -193,6 +195,19 @@ def resolve_page(detection: PageDetection, whitelist: list[str]) -> ResolvedPage
     a hard DETECTION_FAILED flag immediately. This page must NEVER be treated as
     an empty page and must never silently inherit from a neighbor.
     """
+    # —— Fast mode: not_read pages inherit with FLAG_NOT_READ (soft, never blocks Confirm) ——
+    if detection.not_read:
+        return ResolvedPage(
+            page=detection.page,
+            resolved_ticket=None,  # will be filled by build_blocks inheritance
+            flags=[FLAG_NOT_READ],
+            detection_sources=[],
+            max_confidence=0.0,
+            unmatched_raw=[],
+            corrected_from=None,
+            suggestion=None,
+        )
+
     # —— API failure guard: must be checked before anything else ——
     if detection.error:
         log.error(
@@ -368,6 +383,45 @@ def build_blocks(
             # This page is a blocker: Confirm is disabled until the reviewer
             # manually assigns a ticket or the page is re-detected.
             inherited.append(rp)
+
+        elif FLAG_NOT_READ in rp.flags:
+            # Fast mode: not_read page — inherit ticket from previous block (soft flag).
+            # Treated exactly like an empty page for inheritance purposes, but keeps
+            # FLAG_NOT_READ so the UI can show "not read (fast mode)" in the filmstrip.
+            if first_resolved_idx is None:
+                orphan = ResolvedPage(
+                    page=rp.page,
+                    resolved_ticket=None,
+                    flags=[FLAG_NOT_READ, FLAG_ORPHAN_LEADING_PAGES],
+                    detection_sources=[],
+                    max_confidence=0.0,
+                    unmatched_raw=[],
+                    corrected_from=None,
+                    suggestion=None,
+                )
+                inherited.append(orphan)
+            else:
+                prev_ticket = None
+                for prev_rp in reversed(inherited):
+                    if prev_rp.resolved_ticket is not None:
+                        prev_ticket = prev_rp.resolved_ticket
+                        break
+                prev_sources = []
+                for prev_rp in reversed(inherited):
+                    if prev_rp.detection_sources:
+                        prev_sources = prev_rp.detection_sources
+                        break
+                inherited_page = ResolvedPage(
+                    page=rp.page,
+                    resolved_ticket=prev_ticket,
+                    flags=[FLAG_NOT_READ],
+                    detection_sources=prev_sources,
+                    max_confidence=0.0,
+                    unmatched_raw=[],
+                    corrected_from=None,
+                    suggestion=None,
+                )
+                inherited.append(inherited_page)
 
         elif FLAG_UNMATCHED_NUMBER in rp.flags or FLAG_AMBIGUOUS_SUFFIX in rp.flags:
             # ── Three-step UNMATCHED pipeline ──
@@ -704,11 +758,15 @@ def group_detections(
             )
             for c in d.get("candidates", [])
         ]
-        page_detections.append(PageDetection(
+        pd_entry = PageDetection(
             page=d["page"],
             candidates=candidates,
             error=d.get("error"),
-        ))
+        )
+        # Fast mode: mark not_read pages so resolve_page can add FLAG_NOT_READ
+        if d.get("not_read", False):
+            pd_entry.not_read = True
+        page_detections.append(pd_entry)
 
     page_detections.sort(key=lambda p: p.page)
     resolved = [resolve_page(pd, whitelist) for pd in page_detections]

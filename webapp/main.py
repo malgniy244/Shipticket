@@ -46,13 +46,14 @@ from pypdf import PdfReader, PdfWriter
 # ── Import our detection and grouping modules ─────────────────────────────────
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from detect import run_detection
+from detect import run_detection, run_detection_fast
 from grouping import (
     group_detections, repool_from_boundaries, parse_whitelist, HARD_FLAGS,
     FLAG_SECOND_PASS, FLAG_INHERITED_UNMATCHED, FLAG_FUZZY_RESOLVED,
     FLAG_LOW_CONFIDENCE, FLAG_CORRECTION_OBSERVED, FLAG_NON_CONTIGUOUS,
-    FLAG_CORRECTION_CONFLICT,
+    FLAG_CORRECTION_CONFLICT, FLAG_NOT_READ,
 )
+from pink_detect import detect_pink_stickers_batch
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -113,13 +114,14 @@ def require_session(stsession: Optional[str] = Cookie(default=None)):
 
 # ── Job helpers ───────────────────────────────────────────────────────────────
 
-def make_job(job_id: str, whitelist: list[str], pdf_path: str, total_pages: int, batch_type: str = "tib") -> dict:
+def make_job(job_id: str, whitelist: list[str], pdf_path: str, total_pages: int, batch_type: str = "tib", fast_mode: bool = False) -> dict:
     return {
         "id": job_id,
         "whitelist": whitelist,
         "pdf_path": pdf_path,
         "total_pages": total_pages,
         "batch_type": batch_type,    # "tib" | "non_tib"
+        "fast_mode": fast_mode,      # True = local pink detection + lazy identification
         "status": "queued",          # queued | detecting | grouping | ready | confirmed | error
         "progress_page": 0,
         "checkpoint_path": str(Path(pdf_path).parent / "checkpoint.json"),
@@ -171,6 +173,7 @@ def run_detection_background(job_id: str):
         checkpoint_path = job["checkpoint_path"]
         total_pages = job["total_pages"]
         batch_type = job.get("batch_type", "tib")
+        fast_mode = job.get("fast_mode", False)
 
         # Progress callback: update job["progress_page"] as pages complete
         # We do this by polling the checkpoint file size
@@ -194,13 +197,34 @@ def run_detection_background(job_id: str):
         watcher = threading.Thread(target=progress_watcher, daemon=True)
         watcher.start()
 
-        # Run detection (blocking — runs in a thread pool via BackgroundTasks)
-        detection_results = run_detection(
-            pdf_path=pdf_path,
-            checkpoint_path=checkpoint_path,
-            workers=5,
-            whitelist=whitelist,
-        )
+        if fast_mode:
+            # Fast mode: local pink detection for boundaries, then lazy identification
+            log.info("Job %s: fast mode — running local pink detection for boundaries", job_id)
+            doc = fitz.open(pdf_path)
+            page_images = [
+                doc[i].get_pixmap(matrix=fitz.Matrix(150 / 72, 150 / 72), colorspace=fitz.csRGB).tobytes("jpeg")
+                for i in range(len(doc))
+            ]
+            doc.close()
+            pink_flags = detect_pink_stickers_batch(page_images)
+            # pre_boundaries: 1-indexed page numbers where pink sticker detected
+            pre_boundaries = [i + 1 for i, flag in enumerate(pink_flags) if flag]
+            log.info("Job %s: pink boundaries detected on pages %s", job_id, pre_boundaries)
+            detection_results = run_detection_fast(
+                pdf_path=pdf_path,
+                pre_boundaries=pre_boundaries,
+                checkpoint_path=checkpoint_path,
+                workers=5,
+                whitelist=whitelist,
+            )
+        else:
+            # Full mode: run detection on all pages
+            detection_results = run_detection(
+                pdf_path=pdf_path,
+                checkpoint_path=checkpoint_path,
+                workers=5,
+                whitelist=whitelist,
+            )
 
         with jobs_lock:
             job["detection_results"] = detection_results
@@ -299,12 +323,17 @@ def build_review_state(
             has_active_flag = any(f in HARD_FLAGS or f in SOFT_RED_FLAGS for f in blk_flags)
             is_red = is_block_start or has_candidates or has_active_flag
             # Source and confidence from the best candidate on this page
+            # Check if this page was not_read (fast mode)
+            is_not_read = det.get("not_read", False)
             if candidates:
                 best = max(candidates, key=lambda c: c.get("confidence", 0))
                 source = best.get("source", "")
                 confidence = best.get("confidence", 0.0)
                 is_second_pass = best.get("second_pass", False)
                 source_display = "second-pass" if is_second_pass else source
+            elif is_not_read:
+                source_display = "not_read"
+                confidence = 0.0
             elif is_block_start and blk:
                 # Block start with no direct detection — inherited
                 source_display = "inherited"
@@ -317,6 +346,7 @@ def build_review_state(
                 "source": source_display,
                 "confidence": confidence,
                 "is_block_start": is_block_start,
+                "is_not_read": is_not_read,
             }
 
     return {
@@ -387,12 +417,15 @@ async def create_job(
     whitelist_raw: str = Form(...),
     file: UploadFile = File(...),
     batch_type: str = Form(default="tib"),
+    fast_mode: str = Form(default="off"),
     _=Depends(require_session),
 ):
     """Create a new job: parse whitelist, save PDF, start background detection."""
     # Validate batch_type
     if batch_type not in ("tib", "non_tib"):
         batch_type = "tib"  # default gracefully
+    # Parse fast_mode (checkbox sends "on" when checked, absent otherwise)
+    fast_mode_bool = fast_mode.lower() in ("on", "true", "1", "yes")
     # Parse whitelist
     try:
         whitelist = parse_whitelist(whitelist_raw)
@@ -423,7 +456,7 @@ async def create_job(
         raise HTTPException(status_code=422, detail=f"Could not open PDF: {e}")
 
     # Create job
-    job = make_job(job_id, whitelist, pdf_path, total_pages, batch_type=batch_type)
+    job = make_job(job_id, whitelist, pdf_path, total_pages, batch_type=batch_type, fast_mode=fast_mode_bool)
     with jobs_lock:
         jobs[job_id] = job
 
@@ -433,7 +466,7 @@ async def create_job(
     # Start background detection
     background_tasks.add_task(run_detection_background, job_id)
 
-    return {"job_id": job_id, "total_pages": total_pages, "whitelist": whitelist, "batch_type": batch_type}
+    return {"job_id": job_id, "total_pages": total_pages, "whitelist": whitelist, "batch_type": batch_type, "fast_mode": fast_mode_bool}
 
 
 @app.get("/api/jobs/{job_id}/status")

@@ -180,6 +180,7 @@
   .src-handwritten { background: #fef9c3; color: #92400e; }
   .src-second-pass { background: #f3e8ff; color: #6b21a8; }
   .src-inherited { background: #f3f4f6; color: #6b7280; }
+  .src-not-read { background: #f0fdf4; color: #166534; border: 1px dashed #86efac; }
 
   /* Filmstrip modal */
   #filmstrip-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.75); z-index: 99999; }
@@ -250,6 +251,12 @@
         <div class="field">
           <label>Merged scan PDF <span class="req">*</span></label>
           <input type="file" id="pdf-input" accept=".pdf">
+        </div>
+        <div class="field">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <input type="checkbox" id="fast-mode-cb" style="width:16px;height:16px;cursor:pointer;">
+            <span>Fast mode <span style="font-size:.78rem;color:var(--soft);font-weight:400">(local pink detection + first-page-only API — faster for non-TIB batches)</span></span>
+          </label>
         </div>
         <div class="error-msg hidden" id="job-error"></div>
         <button class="btn-primary" id="submit-job-btn" disabled>Start Detection</button>
@@ -383,8 +390,8 @@
 
 <script>
 const BLOCK_COLORS = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#ec4899','#84cc16','#f97316','#6366f1'];
-const HARD_FLAGS = ['UNMATCHED_NUMBER','AMBIGUOUS_SUFFIX','AMBIGUOUS_MATCH','ORPHAN_LEADING_PAGES','CORRECTION_CONFLICT'];
-const SOFT_FLAGS = ['FUZZY_RESOLVED','SECOND_PASS','INHERITED_UNMATCHED','LOW_CONFIDENCE','CORRECTION_OBSERVED','NON_CONTIGUOUS','NO_PRINTED_COVER','PINK_MARKER'];
+const HARD_FLAGS = ['UNMATCHED_NUMBER','AMBIGUOUS_SUFFIX','AMBIGUOUS_MATCH','ORPHAN_LEADING_PAGES','CORRECTION_CONFLICT','DETECTION_FAILED'];
+const SOFT_FLAGS = ['FUZZY_RESOLVED','SECOND_PASS','INHERITED_UNMATCHED','LOW_CONFIDENCE','CORRECTION_OBSERVED','NON_CONTIGUOUS','NO_PRINTED_COVER','PINK_MARKER','NOT_READ'];
 
 let jobId = null, totalPages = 0, whitelist = [], batchType = null;
 let reviewState = null, boundaries = [], repoolTimer = null;
@@ -405,16 +412,18 @@ function hide(id) { el(id).classList.add('hidden'); }
 function flagLabel(f) {
   return {
     UNMATCHED_NUMBER:'UNMATCHED', AMBIGUOUS_SUFFIX:'AMBIGUOUS SUFFIX', AMBIGUOUS_MATCH:'AMBIGUOUS MATCH',
-    ORPHAN_LEADING_PAGES:'ORPHAN', CORRECTION_CONFLICT:'CONFLICT \u2014 MISSED BOUNDARY?',
+    ORPHAN_LEADING_PAGES:'ORPHAN', CORRECTION_CONFLICT:'CONFLICT — MISSED BOUNDARY?',
     FUZZY_RESOLVED:'FUZZY RESOLVED', SECOND_PASS:'SECOND PASS', INHERITED_UNMATCHED:'INHERITED (UNMATCHED)',
     LOW_CONFIDENCE:'LOW CONFIDENCE', CORRECTION_OBSERVED:'CORRECTION OBSERVED',
     NON_CONTIGUOUS:'NON-CONTIGUOUS', MISSING_TICKET:'MISSING TICKET',
-    NO_PRINTED_COVER:'NO PRINTED COVER \u2014 VERIFY BOUNDARY',
+    NO_PRINTED_COVER:'NO PRINTED COVER — VERIFY BOUNDARY',
     PINK_MARKER:'PINK MARKER (boundary signal)',
+    DETECTION_FAILED:'DETECTION FAILED — ASSIGN MANUALLY',
+    NOT_READ:'NOT READ (fast mode)',
   }[f] || f;
 }
 function flagClass(f) { return HARD_FLAGS.includes(f)?'flag-hard':SOFT_FLAGS.includes(f)?'flag-soft':'flag-info'; }
-function srcClass(s) { return {printed:'src-printed',sticker:'src-sticker',handwritten:'src-handwritten','second-pass':'src-second-pass'}[s]||'src-inherited'; }
+function srcClass(s) { return {printed:'src-printed',sticker:'src-sticker',handwritten:'src-handwritten','second-pass':'src-second-pass',not_read:'src-not-read'}[s]||'src-inherited'; }
 function thumbUrl(p) { return `/api/jobs/${jobId}/thumbnail/${p}`; }
 function pageUrl(p) { return `/api/jobs/${jobId}/page/${p}/image`; }
 
@@ -458,6 +467,8 @@ function showApp() { hide('login-screen'); el('app').style.display='flex'; showN
     batchType = el(id).dataset.value;
     el('bt-tib').classList.toggle('selected', batchType==='tib');
     el('bt-nontib').classList.toggle('selected', batchType==='non_tib');
+    // Auto-check fast mode for non-TIB (default per spec)
+    el('fast-mode-cb').checked = (batchType === 'non_tib');
     updateSubmitBtn();
   });
 });
@@ -483,6 +494,7 @@ el('submit-job-btn').addEventListener('click', async () => {
   fd.append('whitelist_raw', wlRaw);
   fd.append('file', pdf);
   fd.append('batch_type', batchType);
+  fd.append('fast_mode', el('fast-mode-cb').checked ? 'on' : 'off');
   try {
     const r = await fetch('/api/jobs',{method:'POST',body:fd});
     if (!r.ok) { const t=await r.text(); throw new Error(t.startsWith('<') ? 'Server error' : t); }
@@ -692,10 +704,45 @@ function renderPhaseBBlock() {
     tv.className = 'pb-ticket-value ' + (isGreen ? 'green' : 'red');
   }
 
-  // Source line
+  // Source line — show per-page source if available, else block-level
+  const perPageInfo = reviewState.per_page && reviewState.per_page[page];
+  const isNotRead = perPageInfo && perPageInfo.is_not_read;
   const sources = b.detection_sources || [];
-  el('pb-source-line').innerHTML = sources.map(s=>`<span class="source-badge ${srcClass(s)}">${s}</span>`).join('') +
-    (b.max_confidence > 0 ? ` <span style="color:var(--soft);font-size:.78rem">conf ${Math.round(b.max_confidence*100)}%</span>` : '');
+  let sourceHtml = '';
+  if (isNotRead) {
+    sourceHtml = `<span class="source-badge src-not-read">not read (fast mode)</span>`;
+  } else if (perPageInfo && perPageInfo.source && perPageInfo.source !== 'inherited') {
+    sourceHtml = `<span class="source-badge ${srcClass(perPageInfo.source)}">${perPageInfo.source}</span>`;
+    if (perPageInfo.confidence > 0) sourceHtml += ` <span style="color:var(--soft);font-size:.78rem">conf ${Math.round(perPageInfo.confidence*100)}%</span>`;
+  } else {
+    sourceHtml = sources.map(s=>`<span class="source-badge ${srcClass(s)}">${s}</span>`).join('') +
+      (b.max_confidence > 0 ? ` <span style="color:var(--soft);font-size:.78rem">conf ${Math.round(b.max_confidence*100)}%</span>` : '');
+  }
+  // Add Scan this page button for not_read pages
+  if (isNotRead) {
+    sourceHtml += ` <button class="btn-scan-page" id="pb-scan-btn" style="font-size:.75rem;padding:3px 10px;margin-left:6px;" title="Run AI scan on this page">Scan this page</button>`;
+  }
+  el('pb-source-line').innerHTML = sourceHtml;
+  // Wire Scan button if present
+  const scanBtn = document.getElementById('pb-scan-btn');
+  if (scanBtn) {
+    scanBtn.addEventListener('click', async () => {
+      scanBtn.disabled = true; scanBtn.textContent = 'Scanning…';
+      try {
+        const res = await api('POST', `/api/jobs/${jobId}/page/${page}/second-pass`);
+        if (res.matched) {
+          el('pb-identity-input').value = res.matched;
+          el('pb-identity-hint').textContent = `✓ Scan found: ${res.matched} (${res.source}, conf ${Math.round((res.confidence||0)*100)}%) — press Enter to commit`;
+          renderDropdown(res.matched);
+        } else {
+          el('pb-identity-hint').textContent = 'Scan found no whitelist match on this page.';
+        }
+      } catch(err) {
+        el('pb-identity-hint').textContent = 'Scan error: ' + err.message;
+      }
+      scanBtn.disabled = false; scanBtn.textContent = 'Scan this page';
+    });
+  }
 
   // Flags
   const flagsDiv = el('pb-flags'); flagsDiv.innerHTML='';
@@ -1055,7 +1102,12 @@ function openFilmstrip(pages, startIdx, title) {
 }
 function showFilmstripPage(idx) {
   filmstripCurrent=idx; const p=filmstripPages[idx];
-  el('filmstrip-img').src=pageUrl(p); el('filmstrip-page-info').textContent=`Page ${p} of ${totalPages}`;
+  el('filmstrip-img').src=pageUrl(p);
+  const perPg = reviewState && reviewState.per_page && reviewState.per_page[p];
+  const notReadBadge = (perPg && perPg.is_not_read) ? ' <span class="source-badge src-not-read" style="vertical-align:middle">not read (fast mode)</span>' : '';
+  const srcBadge = (perPg && perPg.source && perPg.source !== 'inherited' && !perPg.is_not_read)
+    ? ` <span class="source-badge ${srcClass(perPg.source)}" style="vertical-align:middle">${perPg.source}</span>` : '';
+  el('filmstrip-page-info').innerHTML = `Page ${p} of ${totalPages}${notReadBadge}${srcBadge}`;
   el('filmstrip-strip').querySelectorAll('.strip-thumb').forEach((t,i)=>t.classList.toggle('active',i===idx));
 }
 el('filmstrip-prev').addEventListener('click',()=>{if(filmstripCurrent>0)showFilmstripPage(filmstripCurrent-1);});

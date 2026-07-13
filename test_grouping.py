@@ -1578,3 +1578,141 @@ class TestDetectionFailed(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 22 — Fast Mode: FLAG_NOT_READ semantics
+# ─────────────────────────────────────────────────────────────────────────────
+
+from grouping import FLAG_NOT_READ
+
+
+def make_not_read_page(page_num):
+    """Build a raw detection dict simulating a fast-mode not_read page."""
+    return {"page": page_num, "candidates": [], "pink_marker": False, "error": None, "not_read": True}
+
+
+class TestFastModeNotRead(unittest.TestCase):
+    """
+    Verify fast mode not_read semantics:
+      1. not_read pages inherit ticket from previous block (soft flag only)
+      2. not_read pages carry FLAG_NOT_READ (soft, not in HARD_FLAGS)
+      3. not_read pages do NOT block Confirm (has_hard_flag = False)
+      4. A forgotten sticker (no boundary) causes MISSING_TICKET — blocks download
+      5. DETECTION_FAILED on first page: block unidentified, inner pages still not_read
+    """
+
+    WL = ["111111", "222222", "333333"]
+
+    def _run(self, pages):
+        return group_detections(pages, self.WL)
+
+    def test_not_read_page_inherits_ticket(self):
+        """A not_read page must inherit the ticket from the previous resolved page."""
+        pages = [
+            make_page(1, "111111"),
+            make_not_read_page(2),
+            make_not_read_page(3),
+        ]
+        result = self._run(pages)
+        # All pages should be in the 111111 block
+        blocks_111 = [b for b in result.blocks if b.ticket == "111111"]
+        self.assertEqual(len(blocks_111), 1, "111111 block must exist")
+        self.assertIn(2, blocks_111[0].pages, "Page 2 (not_read) must inherit into 111111 block")
+        self.assertIn(3, blocks_111[0].pages, "Page 3 (not_read) must inherit into 111111 block")
+
+    def test_not_read_page_carries_flag(self):
+        """A not_read page must carry FLAG_NOT_READ in its block's flags."""
+        pages = [
+            make_page(1, "111111"),
+            make_not_read_page(2),
+        ]
+        result = self._run(pages)
+        blocks_111 = [b for b in result.blocks if b.ticket == "111111"]
+        self.assertEqual(len(blocks_111), 1)
+        # The block should carry NOT_READ flag (from the not_read page)
+        self.assertIn(FLAG_NOT_READ, blocks_111[0].flags,
+                      "Block containing a not_read page must have FLAG_NOT_READ")
+
+    def test_not_read_flag_is_soft_not_hard(self):
+        """FLAG_NOT_READ must NOT be in HARD_FLAGS — it must not block Confirm."""
+        from grouping import HARD_FLAGS
+        self.assertNotIn(FLAG_NOT_READ, HARD_FLAGS,
+                         "FLAG_NOT_READ must be a soft flag, not a hard flag")
+
+    def test_not_read_does_not_block_confirm(self):
+        """A batch with only not_read inner pages must not have has_hard_flag=True."""
+        pages = [
+            make_page(1, "111111"),
+            make_not_read_page(2),
+            make_not_read_page(3),
+            make_page(4, "222222"),
+            make_not_read_page(5),
+        ]
+        result = self._run(pages)
+        for block in result.blocks:
+            if block.ticket in ("111111", "222222"):
+                self.assertFalse(
+                    block.has_hard_flag,
+                    f"Block {block.ticket} with not_read pages must not have has_hard_flag=True"
+                )
+
+    def test_forgotten_sticker_causes_missing_ticket(self):
+        """
+        If a pink sticker is missed (no boundary), pages that should be a new block
+        are absorbed into the previous block. The missing ticket then fails the
+        reconciliation check (MISSING_TICKET).
+        """
+        # Simulate: ticket 111111 has pages 1-3, but page 4 (start of 222222) has
+        # no detected ticket (sticker missed). Pages 4-5 get absorbed into 111111.
+        # 222222 is never assigned → MISSING_TICKET.
+        pages = [
+            make_page(1, "111111"),
+            make_not_read_page(2),
+            make_not_read_page(3),
+            make_not_read_page(4),  # 222222 sticker missed — absorbed into 111111
+            make_not_read_page(5),
+        ]
+        result = self._run(pages)
+        # 222222 should be in missing_tickets since it was never detected
+        self.assertIn("222222", result.missing_tickets,
+                      "Missed sticker must result in 222222 appearing in missing_tickets")
+
+    def test_detection_failed_on_first_page_inner_pages_not_read(self):
+        """
+        If the first page of a block has DETECTION_FAILED, the block is unidentified
+        (hard flag). Inner pages can still be not_read (they don't inherit the error).
+        """
+        pages = [
+            make_failed_page(1),   # first page of block — DETECTION_FAILED
+            make_not_read_page(2), # inner page — not_read, no error
+            make_not_read_page(3), # inner page — not_read, no error
+            make_page(4, "222222"),
+        ]
+        result = self._run(pages)
+        # Page 1 must be in an isolated DETECTION_FAILED block
+        failed_blocks = [b for b in result.blocks if FLAG_DETECTION_FAILED in b.flags]
+        self.assertGreater(len(failed_blocks), 0, "DETECTION_FAILED block must exist for page 1")
+        # Pages 2 and 3 are not_read — they should NOT carry DETECTION_FAILED
+        for b in result.blocks:
+            if 2 in b.pages or 3 in b.pages:
+                self.assertNotIn(FLAG_DETECTION_FAILED, b.flags,
+                                 "not_read inner pages must not carry DETECTION_FAILED")
+
+    def test_not_read_pages_before_first_detection_get_orphan_flag(self):
+        """
+        not_read pages before the first detection (no previous ticket) must get
+        FLAG_ORPHAN_LEADING_PAGES in addition to FLAG_NOT_READ.
+        """
+        from grouping import FLAG_ORPHAN_LEADING_PAGES
+        pages = [
+            make_not_read_page(1),  # before any detection
+            make_not_read_page(2),  # before any detection
+            make_page(3, "111111"),
+        ]
+        result = self._run(pages)
+        # Pages 1 and 2 should be orphan
+        orphan_blocks = [b for b in result.blocks if FLAG_ORPHAN_LEADING_PAGES in b.flags]
+        orphan_pages = [p for b in orphan_blocks for p in b.pages]
+        self.assertIn(1, orphan_pages, "not_read page before first detection must be ORPHAN")
+        self.assertIn(2, orphan_pages, "not_read page before first detection must be ORPHAN")
