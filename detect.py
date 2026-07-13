@@ -888,6 +888,9 @@ def run_detection_fast(
 
     if progressive_pages:
         log.info("[fast] Progressive fallback: reading %d inner pages: %s", len(progressive_pages), progressive_pages)
+        # not_read_pages was reduced by discard() above — update the watcher now
+        if progress_callback:
+            progress_callback(len(not_read_pages))
         # Filter out already-checkpointed pages
         pending_progressive = [p for p in progressive_pages if p not in checkpoint]
         _metrics["api_calls_progressive"] = len(pending_progressive)

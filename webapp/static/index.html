@@ -341,7 +341,8 @@
           <button id="pb-page-next" disabled>&darr; Next page</button>
         </div>
         <div class="pb-image-wrap">
-          <img id="pb-main-img" src="" alt="Page" title="Click to enlarge">
+          <img id="pb-main-img" src="" alt="Page" title="Click to enlarge"
+               onerror="(function(img){var retries=img._retries=(img._retries||0)+1;if(retries<=3){setTimeout(function(){var s=img.src;img.src='';img.src=s;},2000*retries);}else{img.alt='Image failed to load — reload the page';}})(this)">
         </div>
       </div>
       <!-- Right: identity panel -->

@@ -614,7 +614,7 @@ async def job_status(job_id: str, _=Depends(require_session)):
         raise HTTPException(status_code=404, detail="Job not found")
     return {
         "status": job["status"],
-        "progress_page": job["progress_page"],
+        "progress_page": min(job["progress_page"], job["total_pages"]),
         "total_pages": job["total_pages"],
         "error": job["error"],
         "retry_status": job.get("retry_status"),       # e.g. "retrying page 15 (attempt 2/5)"
