@@ -1179,6 +1179,9 @@ async def startup():
                 with open(tmp, "w") as f:
                     json.dump(job, f)
                 tmp.rename(state_file)
+            # Strip detection_results from the in-memory copy to keep RSS low.
+            # It stays intact on disk (state.json) and is reloaded on demand by repool_job.
+            job["detection_results"] = None
             with jobs_lock:
                 jobs[job_id] = job
             reloaded += 1

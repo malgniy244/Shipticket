@@ -289,6 +289,7 @@
         <h2>Phase A &mdash; Boundary Review</h2>
         <div class="phase-desc">Click a gap between pages to add or remove a split divider. Dividers define where one ticket ends and the next begins. Ticket labels update automatically.</div>
         <div id="phase-a-mode-banner" class="mode-banner hidden"></div>
+        <div id="phase-a-boundary-counter" style="font-size:.9rem;margin-bottom:8px;"></div>
         <button class="btn-success" id="confirm-boundaries-btn">Confirm Boundaries &rarr;</button>
       </div>
       <div id="thumb-grid" class="thumb-grid"></div>
@@ -342,7 +343,9 @@
         </div>
         <div class="pb-image-wrap">
           <img id="pb-main-img" src="" alt="Page" title="Click to enlarge"
-               onerror="(function(img){var retries=img._retries=(img._retries||0)+1;if(retries<=3){setTimeout(function(){var s=img.src;img.src='';img.src=s;},2000*retries);}else{img.alt='Image failed to load — reload the page';}})(this)">
+               onerror="(function(img){img.style.display='none';var btn=document.getElementById('pb-img-reload-btn');if(btn)btn.style.display='inline-block';})(this)"
+               onload="(function(img){img.style.display='';var btn=document.getElementById('pb-img-reload-btn');if(btn)btn.style.display='none';})(this)">
+          <button id="pb-img-reload-btn" style="display:none;margin:16px auto;padding:8px 20px;background:var(--primary);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:.9rem;" onclick="(function(){var img=document.getElementById('pb-main-img');var s=img.src;img.src='';img.style.display='';document.getElementById('pb-img-reload-btn').style.display='none';img.src=s;})()">&#8635; Reload image</button>
         </div>
       </div>
       <!-- Right: identity panel -->
@@ -609,6 +612,19 @@ function getOptimisticTicket(page) {
 }
 
 function renderPhaseA() {
+  // Update boundary counter
+  const expected = whitelist.length - 1;
+  const actual = boundaries.length - 1; // boundaries includes page 1, so splits = length-1
+  const counter = el('phase-a-boundary-counter');
+  if (counter) {
+    if (actual === expected) {
+      counter.innerHTML = `<span style="color:var(--success);font-weight:600">&#10003; ${actual} of ${expected} splits placed (${whitelist.length} tickets)</span>`;
+    } else {
+      const diff = expected - actual;
+      const msg = diff > 0 ? `${diff} split${diff>1?'s':''} missing` : `${-diff} extra split${-diff>1?'s':''}` ;
+      counter.innerHTML = `<span style="color:var(--danger);font-weight:600">&#9888; ${actual} of ${expected} splits placed &mdash; ${msg} (${whitelist.length} tickets expected)</span>`;
+    }
+  }
   const grid = el('thumb-grid'); grid.innerHTML='';
   for (let p=1; p<=totalPages; p++) {
     const bi = pageToBlockIdx(p);
