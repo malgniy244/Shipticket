@@ -10,6 +10,8 @@ Task 5: splitter + ZIP + cleanup.
 import asyncio
 import base64
 import gc
+import hashlib
+import hmac
 import io
 import json
 import logging
@@ -17,6 +19,7 @@ import os
 import re
 import secrets
 import shutil
+import struct
 import tempfile
 import threading
 import time
@@ -81,32 +84,41 @@ app = FastAPI(title="Ship Ticket Splitter")
 jobs: dict[str, dict] = {}
 jobs_lock = threading.Lock()
 
-# ── Session store ─────────────────────────────────────────────────────────────
-# session_token → expiry timestamp
-sessions: dict[str, float] = {}
-sessions_lock = threading.Lock()
+# ── Session store (HMAC-signed stateless tokens) ─────────────────────────────
+# Tokens are self-contained: base64(expiry_u64 || hmac_sha256(secret, expiry_u64))
+# No server-side dict — tokens survive process restarts as long as SESSION_SECRET
+# is stable (it is set as a Render env var: SESSION_SECRET=sts-render-secret-2026-xk9m).
 
 SESSION_COOKIE = "stsession"
 SESSION_TTL = 8 * 3600  # 8 hours
 
 
+def _session_secret_bytes() -> bytes:
+    return SESSION_SECRET.encode()
+
+
 def create_session() -> str:
-    token = secrets.token_hex(32)
-    with sessions_lock:
-        sessions[token] = time.time() + SESSION_TTL
-    return token
+    expiry = int(time.time()) + SESSION_TTL
+    expiry_bytes = struct.pack(">Q", expiry)  # 8-byte big-endian uint64
+    sig = hmac.new(_session_secret_bytes(), expiry_bytes, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(expiry_bytes + sig).decode()
 
 
 def validate_session(token: Optional[str]) -> bool:
     if not token:
         return False
-    with sessions_lock:
-        expiry = sessions.get(token)
-        if expiry is None or time.time() > expiry:
+    try:
+        raw = base64.urlsafe_b64decode(token.encode())
+        if len(raw) != 8 + 32:  # 8 expiry bytes + 32 HMAC bytes
             return False
-        # Refresh on use
-        sessions[token] = time.time() + SESSION_TTL
-        return True
+        expiry_bytes, sig = raw[:8], raw[8:]
+        expected_sig = hmac.new(_session_secret_bytes(), expiry_bytes, hashlib.sha256).digest()
+        if not hmac.compare_digest(sig, expected_sig):
+            return False
+        expiry = struct.unpack(">Q", expiry_bytes)[0]
+        return time.time() < expiry
+    except Exception:
+        return False
 
 
 def require_session(stsession: Optional[str] = Cookie(default=None)):
