@@ -9,6 +9,7 @@ Task 5: splitter + ZIP + cleanup.
 
 import asyncio
 import base64
+import gc
 import io
 import json
 import logging
@@ -65,7 +66,7 @@ log = logging.getLogger(__name__)
 # ── Config from environment ───────────────────────────────────────────────────
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "changeme")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", secrets.token_hex(32))
-JOB_TTL_SECONDS = 24 * 3600  # 24 hours
+JOB_TTL_SECONDS = 4 * 3600  # 4 hours
 
 # Job data root: persistent disk on Render (/data/sts_jobs), tmpfs locally.
 # Set STS_DATA_DIR env var to override. Decision 17.
@@ -381,6 +382,13 @@ def run_detection_background(job_id: str):
         missing = review_state.get("missing_tickets", [])
         job_log(job_id, f"Ready — {n_blocks} block(s) found" + (f", {len(missing)} ticket(s) missing" if missing else ", all tickets matched"))
         log.info("Job %s: detection+grouping complete, %d blocks", job_id, n_blocks)
+
+        # Trim large intermediate data from in-memory job to reduce RSS.
+        # detection_results is already persisted to state.json and reloaded on demand.
+        with jobs_lock:
+            if jobs.get(job_id):
+                jobs[job_id]["detection_results"] = None
+        gc.collect()
 
         # Generate thumbnails in background (after detection closes its doc)
         generate_thumbnails(job_id, pdf_path, job["thumbnail_dir"])
@@ -904,6 +912,16 @@ async def repool_job(job_id: str, boundaries_str: str = Form(..., alias="b"), _=
     batch_type = job.get("batch_type", "tib")
 
     if not detection_results:
+        # detection_results was trimmed from memory after grouping to save RAM.
+        # Reload from the persisted state.json on disk.
+        try:
+            state_path = _state_path(job_id)
+            with open(state_path) as f:
+                saved = json.load(f)
+            detection_results = saved.get("detection_results")
+        except Exception:
+            pass
+    if not detection_results:
         raise HTTPException(status_code=409, detail="Detection results not available")
 
     # Run the same grouping engine code path as the initial grouping
@@ -1019,8 +1037,8 @@ async def confirm_job(job_id: str, _=Depends(require_session)):
         job["confirmed_snapshot"] = confirmed_snapshot
     persist_job(job_id)
 
-    # Schedule cleanup after download (give 10 minutes to download)
-    schedule_cleanup(job_id, delay=600)
+    # Schedule cleanup after download (give 30 seconds to download)
+    schedule_cleanup(job_id, delay=30)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"tickets_{timestamp}.zip"
