@@ -994,12 +994,13 @@ async def confirm_job(job_id: str, _=Depends(require_session)):
         "fast_mode": job.get("fast_mode", False),
         "total_pages": job.get("total_pages"),
         # page_map: {"1": "301532", "2": "301532", ...}
+        # per_page is a dict[int, dict] keyed by page number
         "page_map": {
-            str(pp["page"]): next(
-                (b["ticket"] for b in blocks if pp["page"] in b.get("pages", [])),
+            str(page_num): next(
+                (b["ticket"] for b in blocks if page_num in b.get("pages", [])),
                 None,
             )
-            for pp in review.get("per_page", [])
+            for page_num in review.get("per_page", {})
         },
         # blocks: [{ticket, pages, flags}, ...]
         "blocks": [
