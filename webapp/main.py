@@ -178,6 +178,16 @@ def persist_job(job_id: str):
     snapshot = dict(job)
     state_file = _state_path(job_id)
     tmp_file = state_file.with_suffix(".tmp")
+    # If detection_results was trimmed from memory (None), preserve the on-disk
+    # value so repool can still reload it later.
+    if snapshot.get("detection_results") is None and state_file.exists():
+        try:
+            with open(state_file) as f:
+                existing = json.load(f)
+            if existing.get("detection_results"):
+                snapshot["detection_results"] = existing["detection_results"]
+        except Exception:
+            pass
     try:
         state_file.parent.mkdir(parents=True, exist_ok=True)
         with open(tmp_file, "w") as f:
