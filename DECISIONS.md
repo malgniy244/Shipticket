@@ -667,3 +667,113 @@ Startup complete: 1 jobs reloaded, 0 expired
 ### Fixture suite results confirming current code
 
 67 pages across fixtures #1, #2, #4, #5. Model: `gemini-3-flash-preview`. 0 API errors. 0 wrong-ticket assignments. 113 unit tests passed. Results identical to Decision 16 run.
+
+
+---
+
+## Decision 18 — Stabilization fixes and UX improvements (2026-07-16)
+
+### Context
+
+Four consecutive user sessions failed due to compounding bugs discovered after deployment. This decision documents all fixes applied and the new policies that prevent recurrence.
+
+### Defect log
+
+| # | Defect | Root cause | Commit | Severity |
+|---|---|---|---|---|
+| 1 | Disk mount path had trailing space — all state was ephemeral | Render API returned `"/data "` (with space); app wrote to `/data ` which did not exist | `6bcd632` | Critical |
+| 2 | `confirm_job` 500 on download (TypeError) | `per_page` is `dict[int, dict]` keyed by int; confirm code iterated it as a list expecting `pp["page"]` | `6e7b997` | Critical |
+| 3 | OOM crash after 5+ jobs | `detection_results` (largest per-job structure) held in RAM indefinitely; never trimmed after grouping | `c573af8` + `e430c87` + `2b82251` | Critical |
+| 4 | `persist_job` overwrote disk `detection_results` with `null` | After memory trim set value to `None`, next `persist_job` wrote `null` to `state.json`, destroying disk copy | `e430c87` | Critical |
+| 5 | Startup loaded `detection_results` into RAM for all reloaded jobs | Startup reload did not strip `detection_results`; old jobs consumed full RAM on restart | `2b82251` | High |
+| 6 | Session cookie invalidated on every restart | Sessions stored in plain Python `dict` in memory; `SESSION_SECRET` env var was read but never used | `4ef8c14` | High |
+| 7 | Progress counter exceeded total_pages ("Page 19 of 16") | `not_read_count` emitted once before progressive fallback, never updated after; sum overflowed total | `7581eb8` | Cosmetic |
+| 8 | Blank Phase B image after restart | Browser hit 502 during 7-second startup window; onerror exhausted retries permanently | `2b82251` | Moderate |
+| 9 | No boundary count feedback in Phase A | No indicator of expected vs actual boundary count | `7581eb8` | Usability |
+| 10 | No job ID visible to user | Job ID not in URL; users could not reference or report it | `94b729b` | Usability |
+| 11 | No warning when Phase B blocks were skipped | User could reach reconciliation with unconfirmed blocks | `94b729b` | Usability |
+| 12 | No Back button on reconciliation screen | Users stuck on reconciliation screen if they needed to fix an assignment | `94b729b` | Usability |
+
+### Memory management policy (LOCKED)
+
+- `detection_results` is trimmed from the in-memory job dict immediately after grouping completes. It remains on disk in `state.json` and is reloaded on demand only when `repool_job` is called.
+- `persist_job` checks: if in-memory `detection_results` is `None` but the existing `state.json` has a populated value, the disk value is preserved (not overwritten with `null`).
+- Startup reload strips `detection_results` from all reloaded jobs. Startup RSS is bounded to job metadata only, regardless of how many jobs are on disk.
+- `gc.collect()` is called after each job completes.
+- Job TTL: 4 hours (reduced from 24h). Post-download cleanup: 30 seconds (reduced from 600s).
+
+### Session persistence policy (LOCKED)
+
+Sessions use HMAC-signed stateless tokens (32-byte random nonce + expiry timestamp + HMAC-SHA256 signature, base64url-encoded). The `SESSION_SECRET` env var is the signing key. Tokens are verified on every request by recomputing the HMAC — no server-side session store. Service restarts have zero effect on active sessions.
+
+### Memory headroom (Render Standard plan, 2 GB RAM)
+
+| Batch size | Peak RSS | Fits? |
+|---|---|---|
+| 16 pages | ~249 MB | Yes |
+| 50 pages | ~355 MB | Yes |
+| 100 pages | ~553 MB | Yes |
+| 200 pages | ~850 MB | Yes |
+| 450 pages | ~1,850 MB | Marginal |
+
+The service was upgraded from Starter (512 MB) to Standard ($25/month, 2 GB RAM) on 2026-07-16. OOM crashes are no longer expected for realistic batch sizes.
+
+### Grouping correctness — Bug 7 was cosmetic only (confirmed)
+
+Log evidence from job `c3da42d5` (29 pages, fast mode): all `not_read` pages were logged **before** `[fast] Done` and before `detection+grouping complete`. `run_detection_fast` returns only after all API calls finish; grouping is called synchronously on the return value. There is no race condition. The corrupted counter never affected grouping data.
+
+### UX changes (commit `94b729b`)
+
+1. **Job ID in URL:** After job creation, `?job=<id>` is written to the address bar via `history.replaceState`.
+2. **Phase B unconfirmed warning:** When confirming the last block, the app checks for any skipped blocks. If found, a yellow banner lists the unconfirmed block numbers and jumps to the first one. Reconciliation is unreachable until all blocks are confirmed.
+3. **Back button on reconciliation screen:** `← Back to Review` returns to Phase B at the first unconfirmed block (or block 0 if all confirmed).
+
+---
+
+## Decision 19 — BULK MODE design (2026-07-16) — APPROVED, NOT YET BUILT
+
+### Queue position
+
+Bulk mode is queued **after** the end-to-end driver is green three consecutive times (including one post-forced-restart run). The driver is the acceptance test for bulk mode as well as the stability gate for existing modes.
+
+### Design (confirmed by owner)
+
+**Problem:** Batches of 200+ tickets scanned as one PDF are fragile — one scanning failure or crash poisons the whole batch and is hard to localize.
+
+**Solution:** Bulk mode splits the batch into small files with independent lifecycles under one shared whitelist.
+
+#### Entities
+
+- **Batch:** Created once with the full whitelist (e.g. 200 ticket numbers). Persists on disk like a job. Has a batch ID.
+- **Sub-job:** Each uploaded PDF becomes an independent sub-job with its own detection run, Phase A, Phase B, and state. Sub-jobs share the batch's whitelist but are otherwise fully independent.
+
+#### Key rules (all LOCKED)
+
+| Rule | Behaviour |
+|---|---|
+| Multi-file upload | Multiple PDFs dragged in together or over time; each becomes a sub-job |
+| Parallel review | Sub-job 1 is reviewable while sub-job 3 is still detecting |
+| Expected count per file | Set at upload time (user types the number before submitting the PDF). Per-file reconciliation hard-flags any discrepancy ("expected 30, confirmed 28") |
+| Cross-file duplicate | Ticket confirmed in one sub-job cannot be assigned/confirmed in another. Attempting it → hard flag on the second sub-job, blocks its confirmation, message names the owning sub-job. No silent cross-file merging |
+| File deletion | Any sub-job deletable/replaceable at any point before batch completion (including mid-review). Deleting releases its tickets back to the batch ledger. Confirmed sub-jobs are frozen and unaffected |
+| Two-level reconciliation | Per-file reconciliation (existing checks + expected-count) gates each sub-job's confirmation. Batch-level reconciliation gates download: every whitelist ticket assigned exactly once across all confirmed sub-jobs, none missing, none duplicated, all expected counts satisfied |
+| Download | Per-file ZIPs + whole-batch ZIP. Filename contract unchanged (LOCKED) |
+| Isolation | Bulk mode is additive. TIB/non-TIB single-file flows are untouched — same endpoints, same code paths. Shared engine changes (if any) require full fixture suite green |
+
+#### Batch dashboard
+
+List of sub-jobs with per-file status (detecting / reviewing / confirmed / flagged), running ticket tally (e.g. "assigned 147/200"), and batch reconciliation state. Batch-level display: "200 expected · 7 files confirmed · 200 matched · 0 missing · 0 duplicated."
+
+#### Tests (to be added to e2e driver)
+
+- 3 small PDFs against one whitelist
+- One file deleted mid-review and re-uploaded
+- Expected-count mismatch flagged
+- Cross-file duplicate blocked
+- Batch reconciliation gates download
+
+Fixture PDFs synthesized by splitting fixture #6's file.
+
+### Build estimate
+
+8–12 hours (backend: batch entity, sub-job model, cross-file duplicate ledger, two-level reconciliation, new API endpoints) + 1–2 hours (e2e driver extension).
