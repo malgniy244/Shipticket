@@ -56,6 +56,10 @@ _run_detection_background = None
 _persist_snapshot = None
 _build_zip = None
 
+# Test hook: if set, this callable is used instead of run_detection_background.
+# Set this in tests to inject deterministic review state without real API calls.
+_detection_fn_override = None
+
 
 router = APIRouter(prefix="/api/batches", tags=["bulk"])
 
@@ -195,12 +199,12 @@ def _register_batch_routes(app, *, jobs, jobs_lock, batches, batches_lock,
     @r.post("")
     async def _create_batch(
         whitelist_raw: str = Form(...),
-        batch_type: str = Form(default="tib"),
+        batch_type: str = Form(...),
         fast_mode: str = Form(default="off"),
         _=Depends(require_session),
     ):
         if batch_type not in ("tib", "non_tib"):
-            batch_type = "tib"
+            raise HTTPException(status_code=422, detail="batch_type must be 'tib' or 'non_tib'")
         fast_mode_bool = fast_mode.lower() in ("on", "true", "1", "yes")
         try:
             whitelist = parse_whitelist(whitelist_raw)
@@ -210,8 +214,6 @@ def _register_batch_routes(app, *, jobs, jobs_lock, batches, batches_lock,
             raise HTTPException(status_code=422, detail="Whitelist is empty")
 
         batch_id = str(uuid.uuid4())
-        from webapp.batch_routes import make_batch as _mb  # noqa: avoid circular
-        # Build batch inline (make_batch is a pure function, duplicate here)
         batch = {
             "id": batch_id,
             "whitelist": whitelist,
@@ -229,6 +231,7 @@ def _register_batch_routes(app, *, jobs, jobs_lock, batches, batches_lock,
         return {
             "batch_id": batch_id,
             "whitelist": whitelist,
+            "whitelist_count": len(whitelist),
             "batch_type": batch_type,
             "fast_mode": fast_mode_bool,
         }
@@ -267,6 +270,8 @@ def _register_batch_routes(app, *, jobs, jobs_lock, batches, batches_lock,
             "batch_type": batch["batch_type"],
             "fast_mode": batch["fast_mode"],
             "whitelist": batch["whitelist"],
+            "whitelist_count": len(batch["whitelist"]),
+            "sub_job_count": len(batch["sub_jobs"]),
             "created_at": batch["created_at"],
             "sub_jobs": batch["sub_jobs"],
             "ledger": ledger,
@@ -342,7 +347,9 @@ def _register_batch_routes(app, *, jobs, jobs_lock, batches, batches_lock,
             batch["sub_jobs"].append(sj_summary)
         persist_batch(batch_id)
 
-        background_tasks.add_task(run_detection_background, sub_job_id)
+        import webapp.batch_routes as _br
+        _detect_fn = _br._detection_fn_override if _br._detection_fn_override is not None else run_detection_background
+        background_tasks.add_task(_detect_fn, sub_job_id)
         log.info("Sub-job %s added to batch %s (expected=%d pages=%d)",
                  sub_job_id, batch_id, expected_count, total_pages)
         return {
