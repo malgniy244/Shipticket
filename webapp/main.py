@@ -1236,3 +1236,19 @@ async def startup():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+
+@app.get("/api/admin/job-state/{job_id}")
+async def admin_read_job_state(job_id: str, _=Depends(require_session)):
+    """TEMPORARY: Read state.json from disk for any job (including cleaned-up ones).
+    Used to extract fixture ground truth. Remove after fixture #6 is frozen.
+    """
+    import re
+    if not re.match(r'^[0-9a-f-]{36}$', job_id):
+        raise HTTPException(status_code=400, detail="Invalid job_id")
+    state_path = Path(JOBS_ROOT) / job_id / "state.json"
+    if not state_path.exists():
+        raise HTTPException(status_code=404, detail=f"state.json not found at {state_path}")
+    import json as _json
+    data = _json.loads(state_path.read_text())
+    return data
+
