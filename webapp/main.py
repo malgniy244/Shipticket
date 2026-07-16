@@ -526,20 +526,34 @@ def build_review_state(
 
 
 def generate_thumbnails(job_id: str, pdf_path: str, thumb_dir: str):
-    """Render all pages as small JPEG thumbnails (72 DPI). Non-blocking."""
+    """Render all pages as small JPEG thumbnails (72 DPI) and full-res images (150 DPI).
+
+    Thumbnails go to {thumb_dir}/p{n}.jpg (72 DPI, used in Phase A strip and reconcile).
+    Full-res images go to {thumb_dir}/../pages/p{n}.jpg (150 DPI, used in Phase B viewer).
+    Pre-generating full-res images eliminates on-demand render latency and prevents
+    blank images when the PDF is temporarily unavailable (e.g. during a restart).
+    """
     try:
-        Path(thumb_dir).mkdir(parents=True, exist_ok=True)
+        thumb_path = Path(thumb_dir)
+        thumb_path.mkdir(parents=True, exist_ok=True)
+        pages_path = thumb_path.parent / "pages"
+        pages_path.mkdir(parents=True, exist_ok=True)
         doc = fitz.open(pdf_path)
-        for i in range(len(doc)):
-            page = doc[i]
-            mat = fitz.Matrix(72 / 72, 72 / 72)  # 72 DPI thumbnails
-            pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
-            pix.save(str(Path(thumb_dir) / f"p{i+1}.jpg"))
         n = len(doc)
+        for i in range(n):
+            pg = doc[i]
+            # 72 DPI thumbnail
+            mat_thumb = fitz.Matrix(72 / 72, 72 / 72)
+            pix = pg.get_pixmap(matrix=mat_thumb, colorspace=fitz.csRGB)
+            pix.save(str(thumb_path / f"p{i+1}.jpg"))
+            # 150 DPI full-res
+            mat_full = fitz.Matrix(150 / 72, 150 / 72)
+            pix_full = pg.get_pixmap(matrix=mat_full, colorspace=fitz.csRGB)
+            pix_full.save(str(pages_path / f"p{i+1}.jpg"))
         doc.close()
-        log.info("Job %s: thumbnails generated (%d pages)", job_id, n)
+        log.info("Job %s: pre-generated %d thumbnails + %d full-res images", job_id, n, n)
     except Exception as exc:
-        log.warning("Job %s: thumbnail generation failed: %s", job_id, exc)
+        log.warning("Job %s: image pre-generation failed: %s", job_id, exc)
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -691,11 +705,20 @@ async def get_thumbnail(job_id: str, page: int, _=Depends(require_session)):
 
 @app.get("/api/jobs/{job_id}/page/{page}/image")
 async def get_page_image(job_id: str, page: int, _=Depends(require_session)):
-    """Return a full-size JPEG for a specific page (for the enlarge modal)."""
+    """Return a full-size JPEG for a specific page (Phase B viewer).
+
+    Serves from the pre-generated pages/ cache if available (fast, no PDF needed).
+    Falls back to on-demand render from the PDF if the cache file is missing.
+    """
     with jobs_lock:
         job = jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    # Try pre-generated cache first
+    cached = Path(job["thumbnail_dir"]).parent / "pages" / f"p{page}.jpg"
+    if cached.exists():
+        return FileResponse(str(cached), media_type="image/jpeg")
+    # Fall back to on-demand render
     try:
         doc = fitz.open(job["pdf_path"])
         pg = doc[page - 1]
@@ -703,6 +726,12 @@ async def get_page_image(job_id: str, page: int, _=Depends(require_session)):
         pix = pg.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
         jpeg_bytes = pix.tobytes("jpeg")
         doc.close()
+        # Save to cache for future requests
+        try:
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_bytes(jpeg_bytes)
+        except Exception:
+            pass
         return Response(content=jpeg_bytes, media_type="image/jpeg")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Page render error: {e}")
