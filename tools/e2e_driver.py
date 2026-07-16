@@ -20,7 +20,7 @@ Usage:
         --url https://ship-ticket-splitter.onrender.com \
         --password crystal2026 \
         --pdf /home/ubuntu/upload/SKM_C250i26070917180.pdf \
-        --whitelist "300889,301119,301122,301124,301127,301129,301132,301135,301139,301140,301141,301142,301143,301144,301145,301146,301150,301151,301155,301156,301165,301361" \
+        --whitelist "248258,248256,248259,248260,248261,248262" \
         --render-token rnd_1DKuUH0hqHIuFb4TD8rKlciv5GHo \
         --service-id srv-d9a8k7gk1i2s73f8sb5g
 """
@@ -84,7 +84,7 @@ def step_create_job(session, base_url, pdf_path, whitelist_raw):
         pdf_bytes = f.read()
     r = session.post(
         f"{base_url}/api/jobs",
-        files={"pdf": (os.path.basename(pdf_path), pdf_bytes, "application/pdf")},
+        files={"file": (os.path.basename(pdf_path), pdf_bytes, "application/pdf")},
         data={"whitelist_raw": whitelist_raw, "fast_mode": "true"},
     )
     assert_ok(r, "Create job")
@@ -118,22 +118,41 @@ def step_wait_for_ready(session, base_url, job_id, timeout=360):
     fail(f"Detection did not complete within {timeout}s")
 
 
-def step_fetch_all_images(session, base_url, job_id, total_pages):
+def step_fetch_all_images(session, base_url, job_id, total_pages, max_retries=8):
     log(f"=== Fetch all {total_pages} page images ===")
     failures = []
     for page_num in range(1, total_pages + 1):
-        r = session.get(f"{base_url}/api/jobs/{job_id}/page/{page_num}/image")
-        if r.status_code != 200:
-            failures.append(f"page {page_num}: HTTP {r.status_code}")
-            continue
-        data = r.content
-        if len(data) < 100:
-            failures.append(f"page {page_num}: response too small ({len(data)} bytes)")
-            continue
-        if not is_valid_jpeg(data):
-            failures.append(f"page {page_num}: not a valid JPEG (starts {data[:4].hex()})")
-            continue
-        log(f"page {page_num}/{total_pages}: {len(data):,} bytes OK", 1)
+        ok = False
+        last_err = None
+        for attempt in range(max_retries):
+            try:
+                r = session.get(f"{base_url}/api/jobs/{job_id}/page/{page_num}/image", timeout=15)
+            except Exception as e:
+                last_err = f"request error: {e}"
+                time.sleep(2)
+                continue
+            if r.status_code == 200:
+                data = r.content
+                if len(data) < 100:
+                    last_err = f"response too small ({len(data)} bytes)"
+                    time.sleep(2)
+                    continue
+                if not is_valid_jpeg(data):
+                    last_err = f"not a valid JPEG (starts {data[:4].hex()})"
+                    time.sleep(2)
+                    continue
+                log(f"page {page_num}/{total_pages}: {len(data):,} bytes OK", 1)
+                ok = True
+                break
+            else:
+                last_err = f"HTTP {r.status_code}"
+                if r.status_code in (502, 503, 504):
+                    log(f"page {page_num}: {last_err}, retrying (attempt {attempt+1}/{max_retries})...", 1)
+                    time.sleep(10)
+                    continue
+                break  # non-retryable error
+        if not ok:
+            failures.append(f"page {page_num}: {last_err}")
     if failures:
         fail(f"Image fetch failures:\n" + "\n".join(f"  {f}" for f in failures))
     log(f"All {total_pages} page images: valid JPEG, HTTP 200", 1)
@@ -150,20 +169,28 @@ def step_phase_a(session, base_url, job_id):
     blocks_before = len(blocks)
     log(f"Blocks: {blocks_before}  Whitelist: {len(whitelist)} tickets", 1)
 
-    # Apply one split on the first multi-page block
+    # Apply one split on the first multi-page block — but ONLY if the whitelist has
+    # more tickets than blocks. The confirm endpoint requires every whitelist ticket
+    # to be assigned, so block_count must equal whitelist_count after Phase A.
     split_info = None
-    for b in blocks:
-        if b["end_page"] > b["start_page"]:
-            split_after = b["start_page"]
-            block_id = b["id"]
-            log(f"Splitting block {block_id} (pages {b['start_page']}–{b['end_page']}) after page {split_after}", 1)
-            r = session.patch(
-                f"{base_url}/api/jobs/{job_id}/review",
-                data={"action": "split", "block_id": str(block_id), "split_after_page": str(split_after)},
-            )
-            assert_ok(r, "Split block")
-            split_info = {"block_id": block_id, "split_after": split_after}
-            break
+    whitelist_count = len(whitelist)
+    if whitelist_count > blocks_before:
+        # There's a spare ticket — apply a split to use it
+        for b in blocks:
+            pages = b.get("pages", [])
+            if len(pages) > 1:
+                split_after = pages[0]  # split after first page of block
+                block_id = b["id"]
+                log(f"Splitting block {block_id} (pages {pages[0]}–{pages[-1]}) after page {split_after} (whitelist={whitelist_count} > blocks={blocks_before})", 1)
+                r = session.patch(
+                    f"{base_url}/api/jobs/{job_id}/review",
+                    data={"action": "split", "block_id": str(block_id), "split_after_page": str(split_after)},
+                )
+                assert_ok(r, "Split block")
+                split_info = {"block_id": block_id, "split_after": split_after}
+                break
+    else:
+        log(f"Skipping split: whitelist_count={whitelist_count} == blocks={blocks_before}, no spare ticket", 1)
 
     # Re-read review after split
     r = session.get(f"{base_url}/api/jobs/{job_id}/review")
@@ -176,7 +203,8 @@ def step_phase_a(session, base_url, job_id):
         log(f"Split OK: {blocks_before} → {blocks_after_split} blocks", 1)
 
     # Call repool with current boundaries (Phase A → Phase B transition)
-    boundaries = [b["start_page"] for b in review.get("blocks", [])]
+    # Block structure uses 'pages' list; start_page = pages[0]
+    boundaries = [b["pages"][0] for b in review.get("blocks", []) if b.get("pages")]
     boundaries_str = ",".join(str(p) for p in boundaries)
     log(f"Calling repool with {len(boundaries)} boundaries: {boundaries_str[:80]}...", 1)
     r = session.post(
@@ -214,13 +242,33 @@ def step_force_restart(render_token, service_id, base_url):
     fail("Service did not come back within 120s after restart")
 
 
-def step_verify_session_after_restart(session, base_url, job_id):
+def step_verify_session_after_restart(session, base_url, job_id, total_pages):
     log("=== Step 5c: Verify session cookie survives restart ===")
+    # First confirm the session cookie still works (no re-login needed)
     r = session.get(f"{base_url}/api/jobs/{job_id}/status")
     if r.status_code == 401:
         fail("Session cookie was invalidated by restart — HMAC token fix not working")
     assert_ok(r, "Status after restart (no re-login)")
     log("Session cookie survived restart — HMAC tokens working", 1)
+    # Wait for the service to fully warm up by polling page 1 image until 200
+    log("Waiting for service to fully warm up (page images ready)...", 1)
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        try:
+            r = session.get(f"{base_url}/api/jobs/{job_id}/page/1/image", timeout=10)
+            if r.status_code == 200 and is_valid_jpeg(r.content):
+                log("Service fully warm — page 1 image OK", 1)
+                # Extra stabilisation wait: give the service 10s to finish job reloading
+                # before the re-fetch loop hammers all pages. Without this, page 1 can
+                # return 502 on the very next request during the brief reload window.
+                log("Stabilisation wait (10s)...", 1)
+                time.sleep(10)
+                return
+            log(f"Page 1 image returned HTTP {r.status_code}, retrying...", 1)
+        except Exception as e:
+            log(f"Page 1 image request failed: {e}, retrying...", 1)
+        time.sleep(3)
+    fail("Service did not serve page images within 60s after restart")
 
 
 def step_phase_b(session, base_url, job_id, review):
@@ -284,18 +332,43 @@ def step_phase_b(session, base_url, job_id, review):
                     data={"action": "reassign", "block_id": str(b["id"]), "ticket": ticket},
                 )
                 log(f"  Block {b['id']}: force-reassigned {ticket} to clear flag, HTTP {r.status_code}", 1)
+        # Re-read one more time to confirm cleanup succeeded
+        r = session.get(f"{base_url}/api/jobs/{job_id}/review")
+        assert_ok(r, "Get review after hard-flag cleanup")
+        final_review = r.json()
+        hard_flag_blocks = [b for b in final_review.get("blocks", []) if b.get("has_hard_flag")]
+        unassigned_blocks = [b for b in final_review.get("blocks", []) if not b.get("ticket")]
+        missing_tickets = final_review.get("missing_tickets", [])
+
+    # Preflight: fail loudly if server state is not clean before calling confirm
+    if hard_flag_blocks or unassigned_blocks or missing_tickets:
+        details = []
+        if hard_flag_blocks:
+            details.append(f"{len(hard_flag_blocks)} hard-flag blocks: {[b['id'] for b in hard_flag_blocks]}")
+        if unassigned_blocks:
+            details.append(f"{len(unassigned_blocks)} unassigned blocks: {[b['id'] for b in unassigned_blocks]}")
+        if missing_tickets:
+            details.append(f"missing tickets: {missing_tickets}")
+        fail("Phase B preflight failed — confirm would be rejected: " + "; ".join(details))
 
     log(f"Phase B complete: unassigned={len(unassigned_blocks)} missing_tickets={len(missing_tickets)} hard_flags={len(hard_flag_blocks)}", 1)
     return final_review
 
 
 def step_confirm_job(session, base_url, job_id):
-    log("=== Step 7: Confirm job ===")
-    r = session.post(f"{base_url}/api/jobs/{job_id}/confirm")
+    """Confirm the job and download the ZIP in one step.
+    The confirm endpoint returns the ZIP file directly as a FileResponse.
+    """
+    log("=== Step 7: Confirm + Download ZIP ===")
+    r = session.post(f"{base_url}/api/jobs/{job_id}/confirm", stream=True)
     if r.status_code != 200:
         fail(f"Confirm returned HTTP {r.status_code}: {r.text[:400]}")
-    log(f"Confirm OK", 1)
-    return r.json()
+    content_type = r.headers.get("content-type", "")
+    if "zip" not in content_type and "octet-stream" not in content_type:
+        fail(f"Confirm returned unexpected content-type: {content_type} (expected ZIP)")
+    zip_bytes = r.content
+    log(f"Confirm OK — ZIP downloaded: {len(zip_bytes):,} bytes", 1)
+    return zip_bytes
 
 
 def step_download_zip(session, base_url, job_id):
@@ -383,7 +456,7 @@ def run_session(args, run_number, force_restart=False):
     # 5b. Force restart (run 2 only)
     if force_restart:
         step_force_restart(args.render_token, args.service_id, args.url)
-        step_verify_session_after_restart(session, args.url, job_id)
+        step_verify_session_after_restart(session, args.url, job_id, total_pages)
         mchk("after_restart")
         # Re-fetch all images to confirm they still work after restart
         log("=== Step 5d: Re-fetch all images after restart ===")
@@ -393,13 +466,10 @@ def run_session(args, run_number, force_restart=False):
     final_review = step_phase_b(session, args.url, job_id, review)
     mchk("after_phase_b")
 
-    # 7. Confirm
-    step_confirm_job(session, args.url, job_id)
+    # 7. Confirm + Download ZIP (single step — confirm endpoint returns ZIP directly)
+    zip_bytes = step_confirm_job(session, args.url, job_id)
 
-    # 8. Download ZIP
-    zip_bytes = step_download_zip(session, args.url, job_id)
-
-    # 9. Verify ZIP
+    # 8. Verify ZIP
     pdf_files = step_verify_zip(zip_bytes, args.whitelist)
 
     elapsed = time.time() - start
