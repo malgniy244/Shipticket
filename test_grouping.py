@@ -1716,3 +1716,139 @@ class TestFastModeNotRead(unittest.TestCase):
         orphan_pages = [p for b in orphan_blocks for p in b.pages]
         self.assertIn(1, orphan_pages, "not_read page before first detection must be ORPHAN")
         self.assertIn(2, orphan_pages, "not_read page before first detection must be ORPHAN")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 20: Regression fixture #6 — SKM_C250i26071015110(1).pdf (16 pages)
+#
+# Ground truth: human-confirmed session 2026-07-16, job 67fe40bd-…
+# PDF: 16 pages, non_tib batch, 6 tickets, all pink-marker boundaries.
+# Whitelist: 301053, 299198, 298404, 300588, 300871, 300291
+#
+# Page map (confirmed by owner):
+#   301053 = pages 1–3
+#   299198 = page 4
+#   298404 = page 5
+#   300588 = pages 6–14
+#   300871 = page 15
+#   300291 = page 16
+#
+# All blocks start with a pink sticker page (pink_marker=True on first page).
+# No hard flags expected in the confirmed ground truth.
+#
+# NOTE: '301053' was previously mangled as '01053' in a discarded attempt.
+# This test locks in the correct value.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRegressionFixture6(unittest.TestCase):
+    """
+    Regression fixture for SKM_C250i26071015110(1).pdf (16 pages).
+    Ground truth confirmed by owner on 2026-07-16.
+    Source: tests/fixtures/fixture6/ground_truth.json
+    """
+
+    WHITELIST = ["301053", "299198", "298404", "300588", "300871", "300291"]
+
+    # Expected page→ticket mapping from confirmed_snapshot
+    EXPECTED_PAGE_MAP = {
+        1: "301053", 2: "301053", 3: "301053",
+        4: "299198",
+        5: "298404",
+        6: "300588", 7: "300588", 8: "300588", 9: "300588",
+        10: "300588", 11: "300588", 12: "300588", 13: "300588", 14: "300588",
+        15: "300871",
+        16: "300291",
+    }
+
+    # Expected blocks: (ticket, pages, has_pink_marker)
+    EXPECTED_BLOCKS = [
+        ("301053", [1, 2, 3],                          True),
+        ("299198", [4],                                 True),
+        ("298404", [5],                                 True),
+        ("300588", [6, 7, 8, 9, 10, 11, 12, 13, 14],  True),
+        ("300871", [15],                                True),
+        ("300291", [16],                                True),
+    ]
+
+    def _make_detection_results(self):
+        """
+        Simulated detection results matching the confirmed ground truth.
+        All block-start pages carry pink_marker=True; inner pages do not.
+        All pages read the correct ticket number cleanly.
+        """
+        pages = []
+        for ticket, page_list, _ in self.EXPECTED_BLOCKS:
+            for i, pg in enumerate(page_list):
+                is_first = (i == 0)
+                pages.append(make_page(
+                    pg, value=ticket,
+                    source="printed", confidence=0.97,
+                    pink_marker=is_first,
+                ))
+        # Sort by page number (they are already in order, but be explicit)
+        pages.sort(key=lambda p: p["page"])
+        return pages
+
+    def test_block_count(self):
+        """Exactly 6 blocks must be produced."""
+        pages = self._make_detection_results()
+        result = group_detections(pages, self.WHITELIST, batch_type="non_tib")
+        self.assertEqual(len(result.blocks), 6,
+            f"Expected 6 blocks, got {len(result.blocks)}: "
+            f"{[(b.ticket, b.pages) for b in result.blocks]}")
+
+    def test_page_map(self):
+        """Every page must map to the correct ticket."""
+        pages = self._make_detection_results()
+        result = group_detections(pages, self.WHITELIST, batch_type="non_tib")
+        actual_map = {}
+        for b in result.blocks:
+            for pg in b.pages:
+                actual_map[pg] = b.ticket
+        for pg, expected_ticket in self.EXPECTED_PAGE_MAP.items():
+            self.assertEqual(
+                actual_map.get(pg), expected_ticket,
+                f"Page {pg}: expected ticket {expected_ticket}, got {actual_map.get(pg)}",
+            )
+
+    def test_all_blocks_have_pink_marker_flag(self):
+        """Every block must carry PINK_MARKER flag (all start with a pink sticker page)."""
+        pages = self._make_detection_results()
+        result = group_detections(pages, self.WHITELIST, batch_type="non_tib")
+        for b in result.blocks:
+            self.assertIn("PINK_MARKER", b.flags,
+                f"Block {b.ticket} (pages {b.pages}) missing PINK_MARKER flag")
+
+    def test_no_hard_flags(self):
+        """No block should carry any hard flag in the confirmed ground truth."""
+        pages = self._make_detection_results()
+        result = group_detections(pages, self.WHITELIST, batch_type="non_tib")
+        for b in result.blocks:
+            hard = [f for f in b.flags if f in HARD_FLAGS]
+            self.assertEqual(hard, [],
+                f"Block {b.ticket} has unexpected hard flags: {hard}")
+
+    def test_no_missing_tickets(self):
+        """All 6 whitelist tickets must appear in the result."""
+        pages = self._make_detection_results()
+        result = group_detections(pages, self.WHITELIST, batch_type="non_tib")
+        assigned = {b.ticket for b in result.blocks}
+        for ticket in self.WHITELIST:
+            self.assertIn(ticket, assigned,
+                f"Whitelist ticket {ticket} not found in any block")
+
+    def test_whitelist_301053_not_mangled(self):
+        """Explicit guard: '301053' must appear in the whitelist, not '01053'."""
+        self.assertIn("301053", self.WHITELIST)
+        self.assertNotIn("01053", self.WHITELIST)
+
+    def test_non_tib_mode_required(self):
+        """Fixture #6 is non_tib — running it in tib mode must not produce the same clean result."""
+        pages = self._make_detection_results()
+        result_tib = group_detections(pages, self.WHITELIST, batch_type="tib")
+        result_non_tib = group_detections(pages, self.WHITELIST, batch_type="non_tib")
+        # In non_tib mode all blocks have PINK_MARKER; in tib mode they should not
+        non_tib_pink = all("PINK_MARKER" in b.flags for b in result_non_tib.blocks)
+        tib_pink = all("PINK_MARKER" in b.flags for b in result_tib.blocks)
+        self.assertTrue(non_tib_pink, "non_tib mode must produce PINK_MARKER on all blocks")
+        self.assertFalse(tib_pink, "tib mode must NOT produce PINK_MARKER flags")

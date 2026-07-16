@@ -1,0 +1,70 @@
+{
+  "fixture": 6,
+  "description": "SKM_C250i26071015110(1).pdf — 16-page non-TIB batch, 6 tickets, all pink-marker boundaries",
+  "source_job_id": "67fe40bd-6458-4394-9203-459c1f17df06",
+  "confirmed_at": "2026-07-16T14:08:30.746016",
+  "pdf_filename": "SKM_C250i26071015110(1).pdf",
+  "total_pages": 16,
+  "batch_type": "non_tib",
+  "fast_mode": true,
+  "whitelist": [
+    "301053",
+    "299198",
+    "298404",
+    "300588",
+    "300871",
+    "300291"
+  ],
+  "page_map": {
+    "1": "301053",
+    "2": "301053",
+    "3": "301053",
+    "4": "299198",
+    "5": "298404",
+    "6": "300588",
+    "7": "300588",
+    "8": "300588",
+    "9": "300588",
+    "10": "300588",
+    "11": "300588",
+    "12": "300588",
+    "13": "300588",
+    "14": "300588",
+    "15": "300871",
+    "16": "300291"
+  },
+  "blocks": [
+    {
+      "ticket": "301053",
+      "pages": [1, 2, 3],
+      "flags": ["PINK_MARKER"]
+    },
+    {
+      "ticket": "299198",
+      "pages": [4],
+      "flags": ["PINK_MARKER"]
+    },
+    {
+      "ticket": "298404",
+      "pages": [5],
+      "flags": ["PINK_MARKER"]
+    },
+    {
+      "ticket": "300588",
+      "pages": [6, 7, 8, 9, 10, 11, 12, 13, 14],
+      "flags": ["PINK_MARKER"]
+    },
+    {
+      "ticket": "300871",
+      "pages": [15],
+      "flags": ["PINK_MARKER"]
+    },
+    {
+      "ticket": "300291",
+      "pages": [16],
+      "flags": ["PINK_MARKER"]
+    }
+  ],
+  "expected_pink_boundary_pages": [1, 4, 5, 6, 15, 16],
+  "notes": "Ground truth derived from human-confirmed session on 2026-07-16. Whitelist entry '301053' was previously mangled as '01053' in an earlier (discarded) attempt — this is the correct value as confirmed by the user."
+}
