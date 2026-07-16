@@ -76,6 +76,13 @@ JOB_TTL_SECONDS = 4 * 3600  # 4 hours
 _default_data_dir = str(Path(tempfile.gettempdir()) / "sts_jobs")
 JOBS_ROOT = Path(os.environ.get("STS_DATA_DIR", _default_data_dir))
 
+# Permanent stores — siblings to JOBS_ROOT, never TTL'd.
+# On Render: /data/snapshots/ and /data/fixtures/
+# Locally: /tmp/snapshots/ and /tmp/fixtures/
+_data_parent = JOBS_ROOT.parent
+SNAPSHOTS_ROOT = _data_parent / "snapshots"  # confirmed_snapshot JSON per job
+FIXTURES_ROOT = _data_parent / "fixtures"    # promoted fixture PDFs + snapshots
+
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(title="Ship Ticket Splitter")
 
@@ -225,15 +232,54 @@ def job_log(job_id: str, msg: str, max_lines: int = 100):
                 job["log_lines"] = lines[-max_lines:]
 
 
+def persist_snapshot(job_id: str, snapshot: dict):
+    """Write confirmed_snapshot to the permanent snapshots store.
+
+    This is called at confirm time AND before any cleanup, so snapshots
+    survive TTL expiry and service restarts.  The snapshots store is never
+    TTL'd — it is permanent.
+    """
+    try:
+        SNAPSHOTS_ROOT.mkdir(parents=True, exist_ok=True)
+        snap_path = SNAPSHOTS_ROOT / f"{job_id}.json"
+        tmp_path = snap_path.with_suffix(".tmp")
+        with open(tmp_path, "w") as f:
+            json.dump(snapshot, f)
+        tmp_path.rename(snap_path)
+        log.info("Job %s: confirmed_snapshot persisted to %s", job_id, snap_path)
+    except Exception as exc:
+        log.warning("Job %s: failed to persist snapshot: %s", job_id, exc)
+
+
+def load_snapshot(job_id: str) -> Optional[dict]:
+    """Load a confirmed_snapshot from the permanent snapshots store, or None."""
+    snap_path = SNAPSHOTS_ROOT / f"{job_id}.json"
+    if snap_path.exists():
+        try:
+            with open(snap_path) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return None
+
+
 def cleanup_job(job_id: str):
-    """Delete all files for a job and remove from jobs dict."""
+    """Delete heavy job files and remove from jobs dict.
+
+    Confirmed snapshots are preserved in SNAPSHOTS_ROOT before deletion so
+    they survive TTL expiry.  The per-job directory is then fully removed.
+    """
     with jobs_lock:
         job = jobs.pop(job_id, None)
     if job:
+        # Preserve confirmed_snapshot before deleting files
+        snap = job.get("confirmed_snapshot")
+        if snap:
+            persist_snapshot(job_id, snap)
         pdf_dir = Path(job["pdf_path"]).parent
         if pdf_dir.exists():
             shutil.rmtree(pdf_dir, ignore_errors=True)
-        log.info("Job %s cleaned up", job_id)
+        log.info("Job %s cleaned up (snapshot preserved=%s)", job_id, snap is not None)
 
 
 def schedule_cleanup(job_id: str, delay: float = JOB_TTL_SECONDS):
@@ -1088,6 +1134,11 @@ async def confirm_job(job_id: str, _=Depends(require_session)):
         job["confirmed_snapshot"] = confirmed_snapshot
     persist_job(job_id)
 
+    # Persist snapshot to permanent store immediately — before any TTL cleanup
+    # can fire.  This ensures the snapshot survives even if the 30-second
+    # post-download cleanup runs before the user navigates away.
+    persist_snapshot(job_id, confirmed_snapshot)
+
     # Schedule cleanup after download (give 30 seconds to download)
     schedule_cleanup(job_id, delay=30)
 
@@ -1184,6 +1235,9 @@ app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 async def startup():
     log.info("Ship Ticket Splitter starting up — JOBS_ROOT=%s", JOBS_ROOT)
     JOBS_ROOT.mkdir(parents=True, exist_ok=True)
+    SNAPSHOTS_ROOT.mkdir(parents=True, exist_ok=True)
+    FIXTURES_ROOT.mkdir(parents=True, exist_ok=True)
+    log.info("Permanent stores: snapshots=%s fixtures=%s", SNAPSHOTS_ROOT, FIXTURES_ROOT)
 
     # Reload persisted jobs from disk.
     # Skip jobs that have expired (created_at + JOB_TTL_SECONDS < now).
@@ -1203,7 +1257,11 @@ async def startup():
             # Expire check
             created_at = job.get("created_at", 0)
             if now - created_at > JOB_TTL_SECONDS:
-                log.info("Startup: expiring old job %s", job_id)
+                # Preserve confirmed_snapshot before deleting the directory
+                snap = job.get("confirmed_snapshot")
+                if snap:
+                    persist_snapshot(job_id, snap)
+                log.info("Startup: expiring old job %s (snapshot preserved=%s)", job_id, snap is not None)
                 shutil.rmtree(state_file.parent, ignore_errors=True)
                 expired += 1
                 continue
@@ -1235,18 +1293,18 @@ async def startup():
 
 @app.get("/api/admin/jobs-list")
 async def admin_list_jobs(_=Depends(require_session)):
-    """TEMPORARY: List all job directories on disk with status, page count, whitelist, and confirmed_snapshot presence."""
-    import json as _json
-    jobs_root = Path(JOBS_ROOT)
+    """List all job directories on disk plus all permanent snapshots."""
     result = []
-    if jobs_root.exists():
-        for job_dir in sorted(jobs_root.iterdir()):
+    # Live jobs from JOBS_ROOT
+    if JOBS_ROOT.exists():
+        for job_dir in sorted(JOBS_ROOT.iterdir()):
             state_path = job_dir / "state.json"
             if state_path.exists():
                 try:
-                    data = _json.loads(state_path.read_text())
+                    data = json.loads(state_path.read_text())
                     snap = data.get("confirmed_snapshot")
                     result.append({
+                        "source": "jobs",
                         "job_id": job_dir.name,
                         "status": data.get("status"),
                         "total_pages": data.get("total_pages"),
@@ -1256,24 +1314,117 @@ async def admin_list_jobs(_=Depends(require_session)):
                         "created_at": data.get("created_at"),
                     })
                 except Exception as e:
-                    result.append({"job_id": job_dir.name, "error": str(e)})
+                    result.append({"source": "jobs", "job_id": job_dir.name, "error": str(e)})
+    # Permanent snapshots from SNAPSHOTS_ROOT
+    if SNAPSHOTS_ROOT.exists():
+        for snap_file in sorted(SNAPSHOTS_ROOT.glob("*.json")):
+            job_id = snap_file.stem
+            try:
+                snap = json.loads(snap_file.read_text())
+                result.append({
+                    "source": "snapshots",
+                    "job_id": job_id,
+                    "status": "confirmed",
+                    "total_pages": snap.get("total_pages"),
+                    "whitelist": snap.get("whitelist", []),
+                    "has_confirmed_snapshot": True,
+                    "fast_mode": snap.get("fast_mode"),
+                    "confirmed_at": snap.get("confirmed_at"),
+                })
+            except Exception as e:
+                result.append({"source": "snapshots", "job_id": job_id, "error": str(e)})
     return result
 
 
 @app.get("/api/admin/job-state/{job_id}")
 async def admin_read_job_state(job_id: str, _=Depends(require_session)):
-    """TEMPORARY: Read state.json from disk for any job (including cleaned-up ones).
-    Used to extract fixture ground truth. Remove after fixture #6 is frozen.
-    """
-    import re
+    """Read state.json from disk for any job, or confirmed_snapshot from the permanent store."""
     if not re.match(r'^[0-9a-f-]{36}$', job_id):
         raise HTTPException(status_code=400, detail="Invalid job_id")
-    state_path = Path(JOBS_ROOT) / job_id / "state.json"
-    if not state_path.exists():
-        raise HTTPException(status_code=404, detail=f"state.json not found at {state_path}")
-    import json as _json
-    data = _json.loads(state_path.read_text())
-    return data
+    # Try live job state first
+    state_path = JOBS_ROOT / job_id / "state.json"
+    if state_path.exists():
+        return json.loads(state_path.read_text())
+    # Fall back to permanent snapshot store
+    snap = load_snapshot(job_id)
+    if snap:
+        return {"source": "snapshots", "confirmed_snapshot": snap, "job_id": job_id}
+    raise HTTPException(status_code=404, detail=f"No state.json or snapshot found for job {job_id}")
+
+
+@app.post("/api/admin/promote-fixture/{job_id}")
+async def admin_promote_fixture(job_id: str, _=Depends(require_session)):
+    """Promote a confirmed job to the permanent fixtures directory.
+
+    Copies the confirmed_snapshot JSON and the original PDF (input.pdf) into
+    FIXTURES_ROOT/{job_id}/.  The PDF copy is required so the fixture can be
+    re-run through the detection engine for regression testing.
+
+    If the job directory has already been cleaned up, the snapshot is loaded
+    from the permanent snapshots store and the PDF copy is skipped (the caller
+    must supply the PDF separately if needed).
+    """
+    if not re.match(r'^[0-9a-f-]{36}$', job_id):
+        raise HTTPException(status_code=400, detail="Invalid job_id")
+
+    # Resolve snapshot: live job > snapshots store
+    with jobs_lock:
+        live_job = jobs.get(job_id)
+    snap = None
+    pdf_src: Optional[Path] = None
+
+    if live_job:
+        snap = live_job.get("confirmed_snapshot")
+        if live_job.get("pdf_path"):
+            pdf_src = Path(live_job["pdf_path"])
+    if snap is None:
+        # Try state.json on disk
+        state_path = JOBS_ROOT / job_id / "state.json"
+        if state_path.exists():
+            data = json.loads(state_path.read_text())
+            snap = data.get("confirmed_snapshot")
+            if data.get("pdf_path"):
+                pdf_src = Path(data["pdf_path"])
+    if snap is None:
+        snap = load_snapshot(job_id)
+
+    if snap is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No confirmed_snapshot found for job {job_id} in live jobs, state.json, or snapshots store",
+        )
+
+    # Write to fixtures directory
+    fixture_dir = FIXTURES_ROOT / job_id
+    fixture_dir.mkdir(parents=True, exist_ok=True)
+
+    snap_dest = fixture_dir / "snapshot.json"
+    tmp = snap_dest.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(snap, f, indent=2)
+    tmp.rename(snap_dest)
+
+    pdf_copied = False
+    pdf_dest = fixture_dir / "input.pdf"
+    if pdf_src and pdf_src.exists():
+        shutil.copy2(pdf_src, pdf_dest)
+        pdf_copied = True
+
+    log.info("Fixture promoted: job=%s pdf_copied=%s dest=%s", job_id, pdf_copied, fixture_dir)
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "fixture_dir": str(fixture_dir),
+        "snapshot_written": str(snap_dest),
+        "pdf_copied": pdf_copied,
+        "pdf_dest": str(pdf_dest) if pdf_copied else None,
+        "snapshot_summary": {
+            "total_pages": snap.get("total_pages"),
+            "whitelist": snap.get("whitelist", []),
+            "block_count": len(snap.get("blocks", [])),
+            "confirmed_at": snap.get("confirmed_at"),
+        },
+    }
 
 
 if __name__ == "__main__":
