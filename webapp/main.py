@@ -82,14 +82,20 @@ JOBS_ROOT = Path(os.environ.get("STS_DATA_DIR", _default_data_dir))
 _data_parent = JOBS_ROOT.parent
 SNAPSHOTS_ROOT = _data_parent / "snapshots"  # confirmed_snapshot JSON per job
 FIXTURES_ROOT = _data_parent / "fixtures"    # promoted fixture PDFs + snapshots
+BATCHES_ROOT = _data_parent / "batches"      # bulk-mode batch state (permanent)
 
-# ── FastAPI app ───────────────────────────────────────────────────────────────
+# ── FastAPI app ────────────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Ship Ticket Splitter")
 
-# ── In-memory job store ───────────────────────────────────────────────────────
+# ── In-memory job store ────────────────────────────────────────────────────────────────────────────────
 # job_id → job dict
 jobs: dict[str, dict] = {}
 jobs_lock = threading.Lock()
+
+# ── In-memory batch store (Bulk Mode) ─────────────────────────────────────────────
+# batch_id → batch dict
+batches: dict[str, dict] = {}
+batches_lock = threading.Lock()
 
 # ── Session store (HMAC-signed stateless tokens) ─────────────────────────────
 # Tokens are self-contained: base64(expiry_u64 || hmac_sha256(secret, expiry_u64))
@@ -289,6 +295,74 @@ def schedule_cleanup(job_id: str, delay: float = JOB_TTL_SECONDS):
         cleanup_job(job_id)
     t = threading.Thread(target=_cleanup, daemon=True)
     t.start()
+
+
+# ── Batch helpers (Bulk Mode — Decision 19) ─────────────────────────────────────────────────────────
+
+def make_batch(
+    batch_id: str,
+    whitelist: list[str],
+    batch_type: str = "tib",
+    fast_mode: bool = False,
+) -> dict:
+    """Create a new batch dict.  Persisted permanently in BATCHES_ROOT."""
+    return {
+        "id": batch_id,
+        "whitelist": whitelist,
+        "batch_type": batch_type,
+        "fast_mode": fast_mode,
+        "created_at": time.time(),
+        # sub_jobs: list of sub-job summary dicts (id, status, expected_count, filename)
+        "sub_jobs": [],
+        # claimed_tickets: {ticket: sub_job_id} — populated only at sub-job confirm
+        "claimed_tickets": {},
+        # status: open | complete (complete when batch reconciliation passes)
+        "status": "open",
+    }
+
+
+def _batch_state_path(batch_id: str) -> Path:
+    return BATCHES_ROOT / batch_id / "state.json"
+
+
+def persist_batch(batch_id: str):
+    """Atomically write batch dict to BATCHES_ROOT/{batch_id}/state.json."""
+    with batches_lock:
+        batch = batches.get(batch_id)
+    if not batch:
+        return
+    state_file = _batch_state_path(batch_id)
+    tmp_file = state_file.with_suffix(".tmp")
+    try:
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp_file, "w") as f:
+            json.dump(batch, f)
+        tmp_file.rename(state_file)
+    except Exception as exc:
+        log.warning("Batch %s: failed to persist state: %s", batch_id, exc)
+
+
+def batch_ledger_summary(batch: dict) -> dict:
+    """Compute batch-level reconciliation summary."""
+    wl = batch["whitelist"]
+    claimed = batch["claimed_tickets"]  # {ticket: sub_job_id}
+    claimed_set = set(claimed.keys())
+    wl_set = set(wl)
+    missing = sorted(wl_set - claimed_set)
+    extra = sorted(claimed_set - wl_set)
+    # Count confirmed sub-jobs
+    confirmed_count = sum(
+        1 for sj in batch["sub_jobs"]
+        if sj.get("status") == "confirmed"
+    )
+    return {
+        "total_expected": len(wl),
+        "total_claimed": len(claimed_set),
+        "missing": missing,
+        "extra": extra,
+        "confirmed_sub_jobs": confirmed_count,
+        "reconciled": len(missing) == 0 and len(extra) == 0,
+    }
 
 
 # ── Background detection task ─────────────────────────────────────────────────
@@ -1224,6 +1298,29 @@ async def get_diagnostics(job_id: str, _=Depends(require_session)):
     }
 
 
+# ── Bulk Mode routes (Decision 19) ───────────────────────────────────────────
+from webapp.batch_routes import _register_batch_routes
+_register_batch_routes(
+    app,
+    jobs=jobs,
+    jobs_lock=jobs_lock,
+    batches=batches,
+    batches_lock=batches_lock,
+    JOBS_ROOT=JOBS_ROOT,
+    BATCHES_ROOT=BATCHES_ROOT,
+    require_session=require_session,
+    make_job=make_job,
+    persist_job=persist_job,
+    persist_batch=persist_batch,
+    batch_ledger_summary=batch_ledger_summary,
+    schedule_cleanup=schedule_cleanup,
+    JOB_TTL_SECONDS=JOB_TTL_SECONDS,
+    parse_whitelist=parse_whitelist,
+    run_detection_background=run_detection_background,
+    persist_snapshot=persist_snapshot,
+    build_zip=_build_zip,
+)
+
 # ── Static files (HTML/JS/CSS) ────────────────────────────────────────────────
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
@@ -1237,7 +1334,8 @@ async def startup():
     JOBS_ROOT.mkdir(parents=True, exist_ok=True)
     SNAPSHOTS_ROOT.mkdir(parents=True, exist_ok=True)
     FIXTURES_ROOT.mkdir(parents=True, exist_ok=True)
-    log.info("Permanent stores: snapshots=%s fixtures=%s", SNAPSHOTS_ROOT, FIXTURES_ROOT)
+    BATCHES_ROOT.mkdir(parents=True, exist_ok=True)
+    log.info("Permanent stores: snapshots=%s fixtures=%s batches=%s", SNAPSHOTS_ROOT, FIXTURES_ROOT, BATCHES_ROOT)
 
     # Reload persisted jobs from disk.
     # Skip jobs that have expired (created_at + JOB_TTL_SECONDS < now).
@@ -1289,6 +1387,24 @@ async def startup():
             log.warning("Startup: failed to reload %s: %s", state_file, exc)
 
     log.info("Startup complete: %d jobs reloaded, %d expired", reloaded, expired)
+
+    # Reload persisted batches from BATCHES_ROOT (permanent, never TTL'd).
+    batch_reloaded = 0
+    for batch_state_file in BATCHES_ROOT.glob("*/state.json"):
+        try:
+            with open(batch_state_file) as f:
+                batch = json.load(f)
+            batch_id = batch.get("id")
+            if not batch_id:
+                continue
+            with batches_lock:
+                batches[batch_id] = batch
+            batch_reloaded += 1
+            log.info("Startup: reloaded batch %s (status=%s, sub_jobs=%d)",
+                     batch_id, batch.get("status"), len(batch.get("sub_jobs", [])))
+        except Exception as exc:
+            log.warning("Startup: failed to reload batch %s: %s", batch_state_file, exc)
+    log.info("Startup complete: %d batches reloaded", batch_reloaded)
 
 
 @app.get("/api/admin/jobs-list")
