@@ -1233,9 +1233,32 @@ async def startup():
     log.info("Startup complete: %d jobs reloaded, %d expired", reloaded, expired)
 
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+@app.get("/api/admin/jobs-list")
+async def admin_list_jobs(_=Depends(require_session)):
+    """TEMPORARY: List all job directories on disk with status, page count, whitelist, and confirmed_snapshot presence."""
+    import json as _json
+    jobs_root = Path(JOBS_ROOT)
+    result = []
+    if jobs_root.exists():
+        for job_dir in sorted(jobs_root.iterdir()):
+            state_path = job_dir / "state.json"
+            if state_path.exists():
+                try:
+                    data = _json.loads(state_path.read_text())
+                    snap = data.get("confirmed_snapshot")
+                    result.append({
+                        "job_id": job_dir.name,
+                        "status": data.get("status"),
+                        "total_pages": data.get("total_pages"),
+                        "whitelist": data.get("whitelist", []),
+                        "has_confirmed_snapshot": snap is not None,
+                        "fast_mode": data.get("fast_mode"),
+                        "created_at": data.get("created_at"),
+                    })
+                except Exception as e:
+                    result.append({"job_id": job_dir.name, "error": str(e)})
+    return result
+
 
 @app.get("/api/admin/job-state/{job_id}")
 async def admin_read_job_state(job_id: str, _=Depends(require_session)):
@@ -1252,3 +1275,7 @@ async def admin_read_job_state(job_id: str, _=Depends(require_session)):
     data = _json.loads(state_path.read_text())
     return data
 
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
