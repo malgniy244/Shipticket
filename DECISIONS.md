@@ -730,13 +730,13 @@ Log evidence from job `c3da42d5` (29 pages, fast mode): all `not_read` pages wer
 
 ---
 
-## Decision 19 — BULK MODE design (2026-07-16) — APPROVED, NOT YET BUILT
+## Decision 19 — BULK MODE design (2026-07-16, revised 2026-07-16) — APPROVED, NOT YET BUILT
 
 ### Queue position
 
-Bulk mode is queued **after** the end-to-end driver is green three consecutive times (including one post-forced-restart run). The driver is the acceptance test for bulk mode as well as the stability gate for existing modes.
+Bulk mode starts after the end-to-end driver is green three consecutive times (including one post-forced-restart run). **Driver gate passed** — three green runs logged 2026-07-16.
 
-### Design (confirmed by owner)
+### Design (confirmed by owner, revised lifecycle model)
 
 **Problem:** Batches of 200+ tickets scanned as one PDF are fragile — one scanning failure or crash poisons the whole batch and is hard to localize.
 
@@ -744,36 +744,56 @@ Bulk mode is queued **after** the end-to-end driver is green three consecutive t
 
 #### Entities
 
-- **Batch:** Created once with the full whitelist (e.g. 200 ticket numbers). Persists on disk like a job. Has a batch ID.
+- **Batch:** Created once with the full whitelist (e.g. 200 ticket numbers). Persists on disk indefinitely — the batch stays open until every ticket is confirmed. Has a batch ID.
 - **Sub-job:** Each uploaded PDF becomes an independent sub-job with its own detection run, Phase A, Phase B, and state. Sub-jobs share the batch's whitelist but are otherwise fully independent.
+
+#### Lifecycle rule — tickets claimed only at confirmation (LOCKED)
+
+Tickets are claimed against the batch ledger **only when a sub-job is confirmed**, never at upload or detection time. Consequences:
+
+- A sub-job can be marked **abandoned** at any point before confirmation with no unwinding — it never claimed anything. Its intended tickets remain unassigned in the pool.
+- The batch stays open indefinitely. A sub-job abandoned today can be replaced tomorrow by uploading a new PDF into the same batch. Batch reconciliation stays red (missing tickets) until the replacement is confirmed.
+- **Un-confirm** is the only reversal operation: a confirmed sub-job can be un-confirmed, releasing its tickets back to the pool and returning it to reviewable state. This covers the case where a wrong scan is confirmed before the error is noticed.
 
 #### Key rules (all LOCKED)
 
 | Rule | Behaviour |
 |---|---|
-| Multi-file upload | Multiple PDFs dragged in together or over time; each becomes a sub-job |
+| Multi-file upload | Multiple PDFs uploaded together or over time; each becomes a sub-job |
 | Parallel review | Sub-job 1 is reviewable while sub-job 3 is still detecting |
 | Expected count per file | Set at upload time (user types the number before submitting the PDF). Per-file reconciliation hard-flags any discrepancy ("expected 30, confirmed 28") |
-| Cross-file duplicate | Ticket confirmed in one sub-job cannot be assigned/confirmed in another. Attempting it → hard flag on the second sub-job, blocks its confirmation, message names the owning sub-job. No silent cross-file merging |
-| File deletion | Any sub-job deletable/replaceable at any point before batch completion (including mid-review). Deleting releases its tickets back to the batch ledger. Confirmed sub-jobs are frozen and unaffected |
+| Cross-file duplicate | Ticket already claimed by a confirmed sub-job cannot be confirmed in another. Attempting it → hard flag on the second sub-job at confirm time, blocks confirmation, message names the owning sub-job. No silent cross-file merging |
+| Abandon | Any unconfirmed sub-job can be marked abandoned at any time. No ticket release needed (none were claimed). Abandoned sub-jobs are visible in the dashboard as abandoned |
+| Un-confirm | A confirmed sub-job can be un-confirmed, releasing its tickets back to the pool and returning it to reviewing state. Only reversal operation in the design |
 | Two-level reconciliation | Per-file reconciliation (existing checks + expected-count) gates each sub-job's confirmation. Batch-level reconciliation gates download: every whitelist ticket assigned exactly once across all confirmed sub-jobs, none missing, none duplicated, all expected counts satisfied |
 | Download | Per-file ZIPs + whole-batch ZIP. Filename contract unchanged (LOCKED) |
 | Isolation | Bulk mode is additive. TIB/non-TIB single-file flows are untouched — same endpoints, same code paths. Shared engine changes (if any) require full fixture suite green |
 
 #### Batch dashboard
 
-List of sub-jobs with per-file status (detecting / reviewing / confirmed / flagged), running ticket tally (e.g. "assigned 147/200"), and batch reconciliation state. Batch-level display: "200 expected · 7 files confirmed · 200 matched · 0 missing · 0 duplicated."
+List of sub-jobs with per-file status (detecting / reviewing / confirmed / abandoned / flagged), running ticket tally (e.g. "claimed 147/200"), and batch reconciliation state. Batch-level display: "200 expected · 7 files confirmed · 200 matched · 0 missing · 0 duplicated."
 
 #### Tests (to be added to e2e driver)
 
 - 3 small PDFs against one whitelist
-- One file deleted mid-review and re-uploaded
+- One file abandoned mid-review, replacement uploaded next session into same batch
 - Expected-count mismatch flagged
-- Cross-file duplicate blocked
+- Cross-file duplicate blocked at confirm time
+- Un-confirm releases tickets and returns sub-job to reviewing state
 - Batch reconciliation gates download
 
-Fixture PDFs synthesized by splitting fixture #6's file.
+Fixture PDFs synthesized by splitting an existing fixture file.
 
-### Build estimate
+### Build estimate (revised)
 
-8–12 hours (backend: batch entity, sub-job model, cross-file duplicate ledger, two-level reconciliation, new API endpoints) + 1–2 hours (e2e driver extension).
+| Component | Original | Revised | Change |
+|---|---|---|---|
+| Batch entity + persistence | 1.5 h | 1.5 h | unchanged |
+| Sub-job model + API endpoints | 2 h | 2 h | unchanged |
+| Cross-file duplicate ledger | 1.5 h | 1 h | simpler: check at confirm time only, no real-time tracking |
+| Delete/replace lifecycle | 2 h | **removed** | replaced by abandon (no unwinding) + un-confirm |
+| Abandon + un-confirm operations | — | 0.5 h | new, but trivial (state flag + ledger release) |
+| Two-level reconciliation | 1.5 h | 1.5 h | unchanged |
+| Batch dashboard (frontend) | 2 h | 2 h | unchanged |
+| E2E driver extension | 1.5 h | 1.5 h | updated scenarios |
+| **Total** | **12–13 h** | **10 h** | **−2–3 h** |
