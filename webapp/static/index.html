@@ -316,6 +316,7 @@
         <tbody id="reconcile-tbody"></tbody>
       </table>
       <div class="reconcile-actions">
+        <button class="btn-outline" id="reconcile-back-btn" style="margin-right:12px;padding:10px 22px;font-size:.95rem;">&larr; Back to Review</button>
         <button class="btn-confirm-download" id="final-confirm-btn" disabled>Confirm &amp; Download ZIP</button>
         <span class="reconcile-status-text" id="reconcile-status-text"></span>
       </div>
@@ -330,6 +331,7 @@
       <div class="pb-progress-text" id="pb-progress-text"></div>
       <button class="btn-outline" id="pb-back-btn" style="font-size:.82rem;padding:5px 12px;">&larr; Edit Boundaries (Esc)</button>
     </div>
+    <div id="pb-unconfirmed-banner" style="display:none;background:#fef3c7;color:#92400e;padding:8px 16px;font-size:.88rem;font-weight:600;border-bottom:1px solid #fcd34d;"></div>
     <!-- Block strip -->
     <div class="pb-strip" id="pb-strip"></div>
     <!-- Body -->
@@ -516,6 +518,7 @@ el('submit-job-btn').addEventListener('click', async () => {
     if (!r.ok) { const t=await r.text(); throw new Error(t.startsWith('<') ? 'Server error' : t); }
     const d = await r.json(); jobId=d.job_id; totalPages=d.total_pages; whitelist=d.whitelist;
     activeJobFastMode = !!d.fast_mode;
+    history.replaceState(null, '', '?job=' + jobId);
     // Show active mode loudly in the processing screen title
     const modeLabel = activeJobFastMode
       ? '\u26a1 FAST MODE — reading first pages of pink-bounded blocks only'
@@ -957,7 +960,22 @@ function pbConfirmBlock() {
   pbConfirmed[b.id] = true;
   const isLast = pbCurrentBlock === pbBlocks.length - 1;
   if (isLast) {
-    // All done — go to reconciliation
+    // Check for any unconfirmed blocks before going to reconciliation
+    const unconfirmedIdxs = pbBlocks
+      .map((bl, i) => ({ i, id: bl.id }))
+      .filter(x => !pbConfirmed[x.id]);
+    if (unconfirmedIdxs.length > 0) {
+      // Jump to first unconfirmed block with a banner
+      const blockNums = unconfirmedIdxs.map(x => x.i + 1).join(', ');
+      el('pb-unconfirmed-banner').textContent =
+        `⚠ ${unconfirmedIdxs.length} unconfirmed block${unconfirmedIdxs.length>1?'s':''}: #${blockNums} — please confirm each before downloading.`;
+      el('pb-unconfirmed-banner').style.display = 'block';
+      pbCurrentBlock = unconfirmedIdxs[0].i;
+      pbCurrentPageIdx = 0;
+      renderPhaseBBlock();
+      return;
+    }
+    el('pb-unconfirmed-banner').style.display = 'none';
     hidePhaseBScreen();
     buildReconcileScreen();
     return;
@@ -978,10 +996,10 @@ el('pb-page-next').addEventListener('click', () => {
 el('pb-main-img').addEventListener('click', () => openEnlarge(pbBlocks[pbCurrentBlock].pages[pbCurrentPageIdx]));
 
 el('pb-prev-block-btn').addEventListener('click', () => {
-  if (pbCurrentBlock > 0) { pbCurrentBlock--; pbCurrentPageIdx=0; renderPhaseBBlock(); }
+  if (pbCurrentBlock > 0) { pbCurrentBlock--; pbCurrentPageIdx=0; el('pb-unconfirmed-banner').style.display='none'; renderPhaseBBlock(); }
 });
 el('pb-next-block-btn').addEventListener('click', () => {
-  if (pbCurrentBlock < pbBlocks.length-1) { pbCurrentBlock++; pbCurrentPageIdx=0; renderPhaseBBlock(); }
+  if (pbCurrentBlock < pbBlocks.length-1) { pbCurrentBlock++; pbCurrentPageIdx=0; el('pb-unconfirmed-banner').style.display='none'; renderPhaseBBlock(); }
 });
 
 el('pb-back-btn').addEventListener('click', () => {
@@ -1142,6 +1160,16 @@ function jumpToBlock(blockId) {
   showPhaseBScreen();
   renderPhaseBBlock();
 }
+
+el('reconcile-back-btn').addEventListener('click', () => {
+  // Go back to Phase B at the first unconfirmed block, or block 0 if all confirmed
+  const firstUnconfirmed = pbBlocks.findIndex(bl => !pbConfirmed[bl.id]);
+  pbCurrentBlock = firstUnconfirmed >= 0 ? firstUnconfirmed : 0;
+  pbCurrentPageIdx = 0;
+  hideReconcileScreen();
+  showPhaseBScreen();
+  renderPhaseBBlock();
+});
 
 el('final-confirm-btn').addEventListener('click', async () => {
   el('final-confirm-btn').disabled = true;
