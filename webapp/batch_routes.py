@@ -201,6 +201,7 @@ def _register_batch_routes(app, *, jobs, jobs_lock, batches, batches_lock,
         whitelist_raw: str = Form(...),
         batch_type: str = Form(...),
         fast_mode: str = Form(default="off"),
+        label: Optional[str] = Form(default=None),
         _=Depends(require_session),
     ):
         if batch_type not in ("tib", "non_tib"):
@@ -223,27 +224,44 @@ def _register_batch_routes(app, *, jobs, jobs_lock, batches, batches_lock,
             "sub_jobs": [],
             "claimed_tickets": {},
             "status": "open",
+            "archived": False,
+            "deleted": False,
+            "label": label or None,
         }
         with batches_lock:
             batches[batch_id] = batch
         persist_batch(batch_id)
-        log.info("Batch %s created (whitelist=%d tickets)", batch_id, len(whitelist))
+        log.info("Batch %s created (whitelist=%d tickets, label=%s)", batch_id, len(whitelist), label)
         return {
             "batch_id": batch_id,
             "whitelist": whitelist,
             "whitelist_count": len(whitelist),
             "batch_type": batch_type,
             "fast_mode": fast_mode_bool,
+            "label": label or None,
         }
 
     # ── GET /api/batches ──────────────────────────────────────────────────────
 
     @r.get("")
-    async def _list_batches(_=Depends(require_session)):
+    async def _list_batches(
+        show_archived: str = "0",
+        show_test: str = "0",
+        _=Depends(require_session),
+    ):
         with batches_lock:
             batch_list = list(batches.values())
-        return [
-            {
+        include_archived = show_archived in ("1", "true", "yes")
+        include_test = show_test in ("1", "true", "yes")
+        result = []
+        for b in batch_list:
+            if b.get("deleted"):
+                continue
+            if b.get("archived") and not include_archived:
+                continue
+            if b.get("label") == "test" and not include_test:
+                continue
+            result.append({
                 "batch_id": b["id"],
                 "status": b["status"],
                 "batch_type": b["batch_type"],
@@ -251,10 +269,11 @@ def _register_batch_routes(app, *, jobs, jobs_lock, batches, batches_lock,
                 "sub_job_count": len(b["sub_jobs"]),
                 "sub_jobs": b["sub_jobs"],
                 "created_at": b["created_at"],
+                "archived": b.get("archived", False),
+                "label": b.get("label"),
                 "ledger": batch_ledger_summary(b),
-            }
-            for b in batch_list
-        ]
+            })
+        return result
 
     # ── GET /api/batches/{batch_id} ───────────────────────────────────────────
 
@@ -625,6 +644,74 @@ def _register_batch_routes(app, *, jobs, jobs_lock, batches, batches_lock,
             "status": "ready",
             "released_tickets": released_tickets,
         }
+
+    # ── DELETE /api/batches/{batch_id} ───────────────────────────────────────
+
+    @r.delete("/{batch_id}")
+    async def _delete_batch(batch_id: str, _=Depends(require_session)):
+        """
+        Hard-delete a batch.  Only allowed if the batch has zero confirmed sub-jobs.
+        Removes from memory and from disk (BATCHES_ROOT/{batch_id}/).
+        """
+        with batches_lock:
+            batch = batches.get(batch_id)
+        if not batch:
+            raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found")
+
+        confirmed_count = sum(
+            1 for sj in batch["sub_jobs"] if sj.get("status") == "confirmed"
+        )
+        if confirmed_count > 0:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Cannot delete batch with {confirmed_count} confirmed sub-job(s). "
+                    "Un-confirm or abandon all confirmed sub-jobs first."
+                ),
+            )
+
+        # Remove from memory
+        with batches_lock:
+            batches.pop(batch_id, None)
+
+        # Remove from disk
+        batch_dir = BATCHES_ROOT / batch_id
+        if batch_dir.exists():
+            shutil.rmtree(batch_dir, ignore_errors=True)
+
+        log.info("Batch %s hard-deleted", batch_id)
+        return {"ok": True, "batch_id": batch_id, "deleted": True}
+
+    # ── POST /api/batches/{batch_id}/archive ──────────────────────────────────
+
+    @r.post("/{batch_id}/archive")
+    async def _archive_batch(batch_id: str, _=Depends(require_session)):
+        """
+        Archive a batch: hidden from the default list but not deleted.
+        Can be reversed via POST /api/batches/{id}/unarchive.
+        """
+        with batches_lock:
+            batch = batches.get(batch_id)
+        if not batch:
+            raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found")
+        with batches_lock:
+            batches[batch_id]["archived"] = True
+        persist_batch(batch_id)
+        log.info("Batch %s archived", batch_id)
+        return {"ok": True, "batch_id": batch_id, "archived": True}
+
+    @r.post("/{batch_id}/unarchive")
+    async def _unarchive_batch(batch_id: str, _=Depends(require_session)):
+        """Un-archive a batch: makes it visible in the default list again."""
+        with batches_lock:
+            batch = batches.get(batch_id)
+        if not batch:
+            raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found")
+        with batches_lock:
+            batches[batch_id]["archived"] = False
+        persist_batch(batch_id)
+        log.info("Batch %s un-archived", batch_id)
+        return {"ok": True, "batch_id": batch_id, "archived": False}
 
     # ── GET /api/batches/{batch_id}/download ──────────────────────────────────
 

@@ -334,6 +334,12 @@ def make_batch(
         "claimed_tickets": {},
         # status: open | complete (complete when batch reconciliation passes)
         "status": "open",
+        # archived: hidden from default list; set via POST /api/batches/{id}/archive
+        "archived": False,
+        # deleted: soft-deleted; hard-deleted from disk on DELETE /api/batches/{id}
+        "deleted": False,
+        # label: optional namespace tag (e.g. "test" for driver-created batches)
+        "label": None,
     }
 
 
@@ -1416,11 +1422,20 @@ async def startup():
             batch_id = batch.get("id")
             if not batch_id:
                 continue
+            # Skip hard-deleted batches (should not exist on disk, but defensive)
+            if batch.get("deleted"):
+                log.info("Startup: skipping deleted batch %s", batch_id)
+                continue
+            # Back-fill new fields for batches created before schema update
+            batch.setdefault("archived", False)
+            batch.setdefault("deleted", False)
+            batch.setdefault("label", None)
             with batches_lock:
                 batches[batch_id] = batch
             batch_reloaded += 1
-            log.info("Startup: reloaded batch %s (status=%s, sub_jobs=%d)",
-                     batch_id, batch.get("status"), len(batch.get("sub_jobs", [])))
+            log.info("Startup: reloaded batch %s (status=%s, sub_jobs=%d, archived=%s)",
+                     batch_id, batch.get("status"), len(batch.get("sub_jobs", [])),
+                     batch.get("archived"))
         except Exception as exc:
             log.warning("Startup: failed to reload batch %s: %s", batch_state_file, exc)
     log.info("Startup complete: %d batches reloaded", batch_reloaded)

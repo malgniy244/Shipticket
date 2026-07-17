@@ -1,11 +1,12 @@
-// ── Bulk Mode JavaScript (Decision 19) ────────────────────────────────────────
-// Batch dashboard, sub-job upload, Phase A/B intercept, confirm intercept.
+// bulk_patch.js — Bulk Mode frontend controller (Decision 19)
+// Batch dashboard, multi-file drag-drop upload, Phase A/B intercept, confirm intercept.
 
 // ── Bulk Mode state ──
 let activeBatchId = null;       // batch currently being reviewed in sub-job flow
 let activeSubJobId = null;      // sub-job currently in Phase A/B review
 let batchPollTimer = null;      // setInterval handle for dashboard refresh
 let nbBatchType = null;         // new-batch form: selected batch type
+let _showArchived = false;      // toggle: show archived batches in dashboard
 
 // ── Screen helpers ──
 function showBulkScreen() {
@@ -93,10 +94,10 @@ el('nb-submit-btn').addEventListener('click', async () => {
 
 async function loadBatches() {
   try {
-    const batches = await api('GET', '/api/batches');
+    const qs = _showArchived ? '?show_archived=1' : '';
+    const batches = await api('GET', `/api/batches${qs}`);
     renderBatchesList(batches);
   } catch(e) {
-    // Only show error if container is empty (don't overwrite existing cards)
     const container = el('batches-container');
     if (!container.querySelector('.batch-card')) {
       container.innerHTML = `<div class="error-msg">Failed to load batches: ${e.message}</div>`;
@@ -112,12 +113,18 @@ function ledgerPillClass(ledger) {
 
 function renderBatchesList(batches) {
   const container = el('batches-container');
+
+  // Update the archived-toggle button label
+  const toggleBtn = el('toggle-archived-btn');
+  if (toggleBtn) toggleBtn.textContent = _showArchived ? 'Hide Archived' : 'Show Archived';
+
   if (!batches || batches.length === 0) {
     if (!container.querySelector('.batch-card')) {
       container.innerHTML = `<div style="color:var(--soft);font-size:.95rem;padding:32px 0;text-align:center;">No batches yet. Click <strong>+ New Batch</strong> to create one.</div>`;
     }
     return;
   }
+
   // Remove the "no batches" placeholder if present
   const placeholder = container.querySelector('div:not(.batch-card)');
   if (placeholder && !placeholder.classList.contains('batch-card')) placeholder.remove();
@@ -129,13 +136,18 @@ function renderBatchesList(batches) {
     return b.created_at - a.created_at;
   });
 
+  // Remove cards that are no longer in the response (e.g. deleted)
+  const returnedIds = new Set(batches.map(b => b.batch_id));
+  container.querySelectorAll('.batch-card').forEach(card => {
+    const id = card.id.replace('batch-card-', '');
+    if (!returnedIds.has(id)) card.remove();
+  });
+
   batches.forEach(b => {
     const existing = document.getElementById(`batch-card-${b.batch_id}`);
     if (existing) {
-      // Card already in DOM — update only the dynamic parts, never touch the upload form
       _updateBatchCardDynamic(existing, b);
     } else {
-      // New batch — insert card and attach listeners
       const div = document.createElement('div');
       div.innerHTML = renderBatchCard(b);
       const card = div.firstElementChild;
@@ -145,11 +157,41 @@ function renderBatchesList(batches) {
   });
 }
 
+function _buildActionsHTML(b) {
+  const ledger = b.ledger;
+  const hasConfirmed = (b.sub_jobs || []).some(sj => sj.status === 'confirmed');
+  const canDelete = !hasConfirmed;
+  const isArchived = b.archived;
+  return `
+    <button class="btn-sm primary add-file-btn" data-batch="${b.batch_id}">+ Add File</button>
+    ${ledger.reconciled ? `<button class="btn-sm success download-batch-btn" data-batch="${b.batch_id}">&#8681; Download Batch ZIP</button>` : ''}
+    ${isArchived
+      ? `<button class="btn-sm secondary unarchive-batch-btn" data-batch="${b.batch_id}" style="font-size:.75rem;">Unarchive</button>`
+      : `<button class="btn-sm secondary archive-batch-btn" data-batch="${b.batch_id}" style="font-size:.75rem;">Archive</button>`}
+    ${canDelete ? `<button class="btn-sm danger delete-batch-btn" data-batch="${b.batch_id}" style="font-size:.75rem;">Delete</button>` : ''}
+  `;
+}
+
+function _attachActionsListeners(cardEl, b) {
+  const batchId = b.batch_id;
+  const addBtn = cardEl.querySelector(`.add-file-btn[data-batch="${batchId}"]`);
+  if (addBtn) addBtn.addEventListener('click', () => _openAddFileForm(batchId));
+  const dlBtn = cardEl.querySelector(`.download-batch-btn[data-batch="${batchId}"]`);
+  if (dlBtn) dlBtn.addEventListener('click', () => _downloadBatch(batchId, dlBtn));
+  const archBtn = cardEl.querySelector(`.archive-batch-btn[data-batch="${batchId}"]`);
+  if (archBtn) archBtn.addEventListener('click', () => _archiveBatch(batchId));
+  const unarchBtn = cardEl.querySelector(`.unarchive-batch-btn[data-batch="${batchId}"]`);
+  if (unarchBtn) unarchBtn.addEventListener('click', () => _unarchiveBatch(batchId));
+  const delBtn = cardEl.querySelector(`.delete-batch-btn[data-batch="${batchId}"]`);
+  if (delBtn) delBtn.addEventListener('click', () => _deleteBatch(batchId));
+}
+
 function _updateBatchCardDynamic(cardEl, b) {
   // Update status label
   const titleEl = cardEl.querySelector('.batch-title span[style]');
   if (titleEl) {
-    titleEl.textContent = b.status === 'complete' ? '✓ Complete' : 'Open';
+    const archivedTag = b.archived ? ' <span style="font-size:.7rem;color:var(--soft);font-weight:400;">[archived]</span>' : '';
+    titleEl.innerHTML = (b.status === 'complete' ? '✓ Complete' : 'Open') + archivedTag;
     titleEl.style.color = b.status === 'complete' ? 'var(--success)' : 'var(--warn)';
   }
 
@@ -173,22 +215,14 @@ function _updateBatchCardDynamic(cardEl, b) {
       ${missingText}${reconcileText}`;
   }
 
-  // Update sub-job table (only if upload form is NOT open — we never want to
-  // destroy the form while the user is filling it in)
+  // Update actions area and sub-job table (only if upload form is NOT open)
   const formEl = cardEl.querySelector('.add-sub-job-form');
   const formOpen = formEl && !formEl.classList.contains('hidden');
   if (!formOpen) {
     const actionsEl = cardEl.querySelector('.batch-actions');
     if (actionsEl) {
-      // Rebuild actions area (download button may appear/disappear)
-      actionsEl.innerHTML = `
-        <button class="btn-sm primary add-file-btn" data-batch="${b.batch_id}">+ Add File</button>
-        ${ledger.reconciled ? `<button class="btn-sm success download-batch-btn" data-batch="${b.batch_id}">&#8681; Download Batch ZIP</button>` : ''}`;
-      // Re-attach add-file and download listeners
-      const addBtn = actionsEl.querySelector('.add-file-btn');
-      if (addBtn) addBtn.addEventListener('click', () => _openAddFileForm(b.batch_id));
-      const dlBtn = actionsEl.querySelector('.download-batch-btn');
-      if (dlBtn) dlBtn.addEventListener('click', () => _downloadBatch(b.batch_id, dlBtn));
+      actionsEl.innerHTML = _buildActionsHTML(b);
+      _attachActionsListeners(cardEl, b);
     }
 
     // Update sub-job table
@@ -210,7 +244,6 @@ function _updateBatchCardDynamic(cardEl, b) {
       </tr>`;
     }).join('');
 
-    // Find or create the sub-job table container (between ledger and actions)
     let sjTableEl = cardEl.querySelector('.sub-job-table-container');
     if (!sjTableEl) {
       sjTableEl = document.createElement('div');
@@ -249,6 +282,7 @@ function renderBatchCard(b) {
   const ledger = b.ledger;
   const statusLabel = b.status === 'complete' ? '&#10003; Complete' : 'Open';
   const statusColor = b.status === 'complete' ? 'color:var(--success);font-weight:700;' : 'color:var(--warn);font-weight:700;';
+  const archivedTag = b.archived ? ' <span style="font-size:.7rem;color:var(--soft);font-weight:400;">[archived]</span>' : '';
 
   const missingText = ledger.missing.length > 0
     ? `<span class="ledger-pill err">${ledger.missing.length} missing</span>` : '';
@@ -259,7 +293,7 @@ function renderBatchCard(b) {
     <div class="batch-header">
       <div>
         <div class="batch-title">Batch <span class="batch-id-label">${b.batch_id.slice(0,8)}&hellip;</span>
-          <span style="${statusColor}font-size:.82rem;margin-left:8px;">${statusLabel}</span>
+          <span style="${statusColor}font-size:.82rem;margin-left:8px;">${statusLabel}${archivedTag}</span>
         </div>
         <div style="font-size:.78rem;color:var(--soft);margin-top:2px;">
           ${b.batch_type.toUpperCase()} &middot; ${b.whitelist_count} tickets &middot; ${b.sub_job_count} file${b.sub_job_count!==1?'s':''}
@@ -275,18 +309,20 @@ function renderBatchCard(b) {
       <div style="color:var(--soft);font-size:.85rem;padding:8px 0;">No files uploaded yet.</div>
     </div>
     <div class="batch-actions">
-      <button class="btn-sm primary add-file-btn" data-batch="${b.batch_id}">+ Add File</button>
-      ${ledger.reconciled ? `<button class="btn-sm success download-batch-btn" data-batch="${b.batch_id}">&#8681; Download Batch ZIP</button>` : ''}
+      ${_buildActionsHTML(b)}
     </div>
     <div class="add-sub-job-form hidden" id="add-sj-form-${b.batch_id}">
-      <h4>Upload a file into this batch</h4>
-      <div class="field">
-        <label>PDF file <span class="req">*</span></label>
-        <input type="file" accept=".pdf" id="sj-pdf-${b.batch_id}">
+      <h4>Add files to this batch</h4>
+      <div class="dropzone" id="sj-dropzone-${b.batch_id}">
+        <div class="dropzone-label">Drag &amp; drop PDF files here, or click to browse</div>
+        <input type="file" accept=".pdf" multiple id="sj-pdf-${b.batch_id}" style="display:none;">
       </div>
-      <div class="field">
-        <label>Expected ticket count in this file <span class="req">*</span></label>
-        <input type="number" min="1" id="sj-expected-${b.batch_id}" placeholder="e.g. 30">
+      <div class="file-count-table hidden" id="sj-count-table-${b.batch_id}">
+        <p style="font-size:.82rem;color:var(--soft);margin:8px 0 4px;">Enter the expected ticket count for each file:</p>
+        <table class="sub-job-table" id="sj-count-rows-${b.batch_id}">
+          <thead><tr><th>File</th><th>Expected tickets <span class="req">*</span></th></tr></thead>
+          <tbody></tbody>
+        </table>
       </div>
       <div class="error-msg hidden" id="sj-error-${b.batch_id}"></div>
       <div style="display:flex;gap:8px;margin-top:8px;">
@@ -297,7 +333,7 @@ function renderBatchCard(b) {
   </div>`;
 }
 
-// ── Action helpers (used by both initial attach and incremental update) ──
+// ── Action helpers ──
 
 function _openAddFileForm(batchId) {
   const form = el(`add-sj-form-${batchId}`);
@@ -326,6 +362,33 @@ function _downloadBatch(batchId, btn) {
       btn.disabled = false;
       btn.textContent = '\u2B07 Download Batch ZIP';
     });
+}
+
+function _archiveBatch(batchId) {
+  api('POST', `/api/batches/${batchId}/archive`)
+    .then(() => loadBatches())
+    .catch(e => alert('Archive failed: ' + e.message));
+}
+
+function _unarchiveBatch(batchId) {
+  api('POST', `/api/batches/${batchId}/unarchive`)
+    .then(() => loadBatches())
+    .catch(e => alert('Unarchive failed: ' + e.message));
+}
+
+function _deleteBatch(batchId) {
+  if (!confirm(`Delete batch ${batchId.slice(0,8)}…? This cannot be undone.`)) return;
+  fetch(`/api/batches/${batchId}`, {method:'DELETE'})
+    .then(r => {
+      if (!r.ok) return r.text().then(t => { throw new Error(t.startsWith('<') ? 'Server error' : t); });
+      return r.json();
+    })
+    .then(() => {
+      const card = el(`batch-card-${batchId}`);
+      if (card) card.remove();
+      loadBatches();
+    })
+    .catch(e => alert('Delete failed: ' + e.message));
 }
 
 function _reviewSubJob(batchId, sjId) {
@@ -363,63 +426,126 @@ function _unconfirmSubJob(batchId, sjId) {
     .catch(e => alert('Un-confirm failed: ' + e.message));
 }
 
+// ── Multi-file dropzone and per-file expected-count table ──
+
+function _initDropzone(batchId) {
+  const dropzone = el(`sj-dropzone-${batchId}`);
+  const fileInput = el(`sj-pdf-${batchId}`);
+  const countTable = el(`sj-count-table-${batchId}`);
+  const uploadBtn = document.querySelector(`.sj-upload-btn[data-batch="${batchId}"]`);
+  if (!dropzone || !fileInput || !countTable || !uploadBtn) return;
+
+  // Click on dropzone opens file picker
+  dropzone.addEventListener('click', () => fileInput.click());
+
+  // Drag-and-drop
+  dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('dragover'); });
+  dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+  dropzone.addEventListener('drop', e => {
+    e.preventDefault();
+    dropzone.classList.remove('dragover');
+    _handleFiles(batchId, Array.from(e.dataTransfer.files).filter(f => f.name.toLowerCase().endsWith('.pdf')));
+  });
+
+  // File input change
+  fileInput.addEventListener('change', () => {
+    _handleFiles(batchId, Array.from(fileInput.files));
+  });
+}
+
+function _handleFiles(batchId, files) {
+  if (!files || files.length === 0) return;
+  const countTable = el(`sj-count-table-${batchId}`);
+  const tbody = countTable.querySelector('tbody');
+  const uploadBtn = document.querySelector(`.sj-upload-btn[data-batch="${batchId}"]`);
+  if (!tbody || !uploadBtn) return;
+
+  // Store files on the form element for later retrieval
+  const form = el(`add-sj-form-${batchId}`);
+  form._pendingFiles = files;
+
+  // Build per-file rows
+  tbody.innerHTML = files.map((f, i) => `
+    <tr>
+      <td style="font-size:.82rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${f.name}">${f.name}</td>
+      <td><input type="number" min="1" class="sj-count-input" data-idx="${i}" style="width:80px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;" placeholder="e.g. 5"></td>
+    </tr>
+  `).join('');
+
+  countTable.classList.remove('hidden');
+
+  // Validate: all count inputs must be filled with ≥1
+  const validateCounts = () => {
+    const inputs = tbody.querySelectorAll('.sj-count-input');
+    const allFilled = Array.from(inputs).every(inp => inp.value && parseInt(inp.value) >= 1);
+    uploadBtn.disabled = !allFilled;
+  };
+  tbody.querySelectorAll('.sj-count-input').forEach(inp => inp.addEventListener('input', validateCounts));
+  validateCounts();
+}
+
 function attachBatchCardListeners(b) {
   const batchId = b.batch_id;
+  _initDropzone(batchId);
+  _attachActionsListeners(document.getElementById(`batch-card-${batchId}`), b);
 
-  // Add File toggle
-  const addBtn = document.querySelector(`.add-file-btn[data-batch="${batchId}"]`);
-  if (addBtn) addBtn.addEventListener('click', () => _openAddFileForm(batchId));
-
-  // Sub-job upload form validation + submit
-  const pdfInput = el(`sj-pdf-${batchId}`);
-  const expInput = el(`sj-expected-${batchId}`);
+  // Upload button: submit all pending files sequentially
   const uploadBtn = document.querySelector(`.sj-upload-btn[data-batch="${batchId}"]`);
-  if (pdfInput && expInput && uploadBtn) {
-    const validate = () => {
-      uploadBtn.disabled = !(pdfInput.files[0] && expInput.value && parseInt(expInput.value) >= 1);
-    };
-    pdfInput.addEventListener('change', validate);
-    expInput.addEventListener('input', validate);
-
+  if (uploadBtn) {
     uploadBtn.addEventListener('click', async () => {
-      const pdf = pdfInput.files[0];
-      const expected = parseInt(expInput.value);
-      if (!pdf || !expected) return;
+      const form = el(`add-sj-form-${batchId}`);
+      const files = form._pendingFiles || [];
+      const countTable = el(`sj-count-table-${batchId}`);
+      const inputs = countTable ? countTable.querySelectorAll('.sj-count-input') : [];
+      if (files.length === 0) return;
+
       const errEl = el(`sj-error-${batchId}`);
       errEl.classList.add('hidden');
       uploadBtn.disabled = true;
-      uploadBtn.innerHTML = '<span class="spinner"></span>Uploading…';
-      try {
-        const fd = new FormData();
-        fd.append('file', pdf);
-        fd.append('expected_count', String(expected));
-        const r = await fetch(`/api/batches/${batchId}/sub-jobs`, {method:'POST', body: fd});
-        if (!r.ok) { const t = await r.text(); throw new Error(t.startsWith('<') ? 'Server error' : t); }
-        const d = await r.json();
-        // Enter single-job review flow for this sub-job
-        activeBatchId = batchId;
-        activeSubJobId = d.sub_job_id;
-        jobId = d.sub_job_id;
-        totalPages = d.total_pages;
-        whitelist = d.whitelist;
-        batchType = d.batch_type;
-        activeJobFastMode = !!d.fast_mode;
-        hideBulkScreens();
-        hide('new-job-screen');
-        const modeLabel = activeJobFastMode
-          ? '\u26a1 FAST MODE \u2014 reading first pages of pink-bounded blocks only'
-          : '\u25a0 FULL MODE \u2014 reading every page';
-        el('progress-title').textContent = modeLabel;
-        show('progress-screen');
-        el('main-area').style.display = '';
-        pollStatus();
-      } catch(e) {
-        const errEl2 = el(`sj-error-${batchId}`);
-        errEl2.textContent = 'Error: ' + e.message;
-        errEl2.classList.remove('hidden');
-        uploadBtn.disabled = false;
-        uploadBtn.textContent = 'Start Detection';
+
+      // Upload files one at a time; navigate into the first one's review flow
+      let firstSubJobData = null;
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const expected = parseInt(inputs[i] ? inputs[i].value : '0');
+        if (!expected || expected < 1) continue;
+        uploadBtn.innerHTML = `<span class="spinner"></span>Uploading ${i+1}/${files.length}…`;
+        try {
+          const fd = new FormData();
+          fd.append('file', file);
+          fd.append('expected_count', String(expected));
+          const r = await fetch(`/api/batches/${batchId}/sub-jobs`, {method:'POST', body: fd});
+          if (!r.ok) { const t = await r.text(); throw new Error(t.startsWith('<') ? 'Server error' : t); }
+          const d = await r.json();
+          if (!firstSubJobData) firstSubJobData = d;
+        } catch(e) {
+          errEl.textContent = `Error uploading ${file.name}: ${e.message}`;
+          errEl.classList.remove('hidden');
+          uploadBtn.disabled = false;
+          uploadBtn.textContent = 'Start Detection';
+          return;
+        }
       }
+
+      if (!firstSubJobData) return;
+
+      // Navigate into the first sub-job's review flow
+      activeBatchId = batchId;
+      activeSubJobId = firstSubJobData.sub_job_id;
+      jobId = firstSubJobData.sub_job_id;
+      totalPages = firstSubJobData.total_pages;
+      whitelist = firstSubJobData.whitelist;
+      batchType = firstSubJobData.batch_type;
+      activeJobFastMode = !!firstSubJobData.fast_mode;
+      hideBulkScreens();
+      hide('new-job-screen');
+      const modeLabel = activeJobFastMode
+        ? '\u26a1 FAST MODE \u2014 reading first pages of pink-bounded blocks only'
+        : '\u25a0 FULL MODE \u2014 reading every page';
+      el('progress-title').textContent = modeLabel;
+      show('progress-screen');
+      el('main-area').style.display = '';
+      pollStatus();
     });
   }
 
@@ -428,15 +554,20 @@ function attachBatchCardListeners(b) {
   if (cancelBtn) cancelBtn.addEventListener('click', () => {
     el(`add-sj-form-${batchId}`).classList.add('hidden');
   });
-
-  // Download batch ZIP
-  const dlBtn = document.querySelector(`.download-batch-btn[data-batch="${batchId}"]`);
-  if (dlBtn) dlBtn.addEventListener('click', () => _downloadBatch(batchId, dlBtn));
 }
 
+// ── Archive toggle button (in bulk-screen header) ──
+(function() {
+  const toggleBtn = el('toggle-archived-btn');
+  if (toggleBtn) {
+    toggleBtn.addEventListener('click', () => {
+      _showArchived = !_showArchived;
+      loadBatches();
+    });
+  }
+})();
+
 // ── Sub-job confirm: override the final-confirm-btn for sub-job flow ──
-// When activeSubJobId is set, confirm goes to the batch sub-job endpoint.
-// Otherwise it uses the existing single-job endpoint (unchanged).
 el('final-confirm-btn').addEventListener('click', async function(e) {
   if (!activeSubJobId) return; // handled by original listener
   e.stopImmediatePropagation();
@@ -479,7 +610,6 @@ el('final-confirm-btn').addEventListener('click', async function(e) {
 }, true); // capture phase so it fires before the original listener
 
 // ── Back-to-batch from Phase A ──
-// Wrap buildPhaseA to inject a "Back to Batch" button when in sub-job mode.
 (function() {
   const orig = buildPhaseA;
   window.buildPhaseA = function() {

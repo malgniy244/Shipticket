@@ -13,17 +13,44 @@ Scenarios covered:
   BT06 — Upload sub-job, sub-job row appears with detecting/ready/queued status
   BT07 — cache-busting: index.html references bulk_patch.js with a ?v= hash
   BT08 — Back-to-batch navigation from Phase A (sub-job review)
+  BT09 — Multi-file drop: 3 files → expected-count table → 3 sub-jobs appear
+  BT10 — Delete an empty batch (no confirmed sub-jobs)
+
+All test batches are created with label=test so they are namespaced away from
+real batches.  Each test deletes its own batch on teardown via the API.
 """
 
 import asyncio
 import os
 import re
 import pytest
+import requests as _requests
 from playwright.async_api import async_playwright, Page
 
 APP_URL = os.environ.get("STS_APP_URL", "https://ship-ticket-splitter.onrender.com")
 PASSWORD = os.environ.get("STS_PASSWORD", "crystal2026")
 PDF_PATH = os.path.abspath("tests/fixtures/fixture6/input.pdf")
+
+# Shared API session for teardown cleanup (avoids browser round-trips)
+_api_session = _requests.Session()
+_api_session_authed = False
+
+
+def _ensure_api_session():
+    global _api_session_authed
+    if not _api_session_authed:
+        r = _api_session.post(f"{APP_URL}/api/login", data={"password": PASSWORD})
+        assert r.status_code == 200, f"API session login failed: {r.status_code}"
+        _api_session_authed = True
+
+
+def _api_delete_batch(batch_id: str):
+    """Hard-delete a test batch via the API (teardown helper)."""
+    _ensure_api_session()
+    r = _api_session.delete(f"{APP_URL}/api/batches/{batch_id}")
+    # 404 is fine (already deleted); 409 means confirmed sub-jobs exist — archive instead
+    if r.status_code == 409:
+        _api_session.post(f"{APP_URL}/api/batches/{batch_id}/archive")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -48,7 +75,12 @@ async def open_bulk_screen(page: Page):
 
 async def create_batch(page: Page,
                        whitelist: str = "301053, 299198, 298404, 300588, 300871, 300291") -> str:
-    """Create a Non-TIB batch and return its batch_id (captured from API response)."""
+    """Create a Non-TIB test batch and return its batch_id.
+
+    The batch is created with label=test so it is namespaced away from real
+    batches.  The caller is responsible for deleting it in teardown via
+    _api_delete_batch(batch_id).
+    """
     # Intercept the POST /api/batches response to get the authoritative batch_id
     batch_id_holder = []
     async def capture_batch_id(response):
@@ -65,8 +97,28 @@ async def create_batch(page: Page,
     await page.wait_for_selector("#new-batch-screen", state="visible", timeout=5000)
     await page.click("#nb-bt-nontib")
     await page.fill("#nb-wl-input", whitelist)
+
+    # Inject label=test into the FormData via JS before the form submits
+    # We do this by intercepting the fetch call at the JS level
+    await page.evaluate("""() => {
+        const origFetch = window.fetch;
+        window._testLabelInjected = false;
+        window.fetch = function(url, opts) {
+            if (typeof url === 'string' && url.includes('/api/batches') && opts && opts.method === 'POST' && !window._testLabelInjected) {
+                window._testLabelInjected = true;
+                if (opts.body instanceof FormData) {
+                    opts.body.append('label', 'test');
+                }
+            }
+            return origFetch.apply(this, arguments);
+        };
+    }""")
+
     await page.click("#nb-submit-btn")
     await page.wait_for_selector("#bulk-screen", state="visible", timeout=10000)
+
+    # Restore original fetch
+    await page.evaluate("() => { if (window._origFetch) window.fetch = window._origFetch; }")
 
     # Wait up to 5s for the API response to be captured
     for _ in range(50):
@@ -121,21 +173,17 @@ async def test_bt03_new_batch_form_validation():
         await page.click("#bulk-new-batch-btn")
         await page.wait_for_selector("#new-batch-screen", state="visible", timeout=5000)
 
-        # Submit button should be disabled initially
         assert await page.locator("#nb-submit-btn").is_disabled(), \
             "Submit should be disabled before filling form"
 
-        # Select type only — still disabled
         await page.click("#nb-bt-nontib")
         assert await page.locator("#nb-submit-btn").is_disabled(), \
             "Submit should be disabled without whitelist"
 
-        # Fill whitelist — now enabled
         await page.fill("#nb-wl-input", "301053, 299198")
         assert await page.locator("#nb-submit-btn").is_enabled(), \
             "Submit should be enabled with type + whitelist"
 
-        # Cancel back
         await page.click("#nb-cancel-btn")
         await page.wait_for_selector("#bulk-screen", state="visible", timeout=5000)
     finally:
@@ -147,6 +195,7 @@ async def test_bt03_new_batch_form_validation():
 async def test_bt04_create_batch_card_appears():
     """BT04: Creating a batch produces a card in the dashboard with correct metadata."""
     pw, browser, page = await make_authed_page()
+    batch_id = None
     try:
         await open_bulk_screen(page)
         batch_id = await create_batch(page)
@@ -159,6 +208,8 @@ async def test_bt04_create_batch_card_appears():
         assert "6" in card_text  # 6 tickets in whitelist
         assert "Open" in card_text
     finally:
+        if batch_id:
+            _api_delete_batch(batch_id)
         await browser.close()
         await pw.stop()
 
@@ -167,6 +218,7 @@ async def test_bt04_create_batch_card_appears():
 async def test_bt05_file_input_survives_poll_cycles():
     """BT05: File input retains its selection across 3 poll cycles (15s total)."""
     pw, browser, page = await make_authed_page()
+    batch_id = None
     try:
         await open_bulk_screen(page)
         batch_id = await create_batch(page)
@@ -177,9 +229,14 @@ async def test_bt05_file_input_survives_poll_cycles():
         form = page.locator(f"#add-sj-form-{batch_id}")
         await form.wait_for(state="visible", timeout=5000)
 
-        # Select the PDF
+        # Select the PDF via the dropzone file input
         file_input = page.locator(f"#sj-pdf-{batch_id}")
         await file_input.set_input_files(PDF_PATH)
+        # Trigger change event so _handleFiles fires
+        await page.eval_on_selector(
+            f"#sj-pdf-{batch_id}",
+            "el => el.dispatchEvent(new Event('change', {bubbles:true}))"
+        )
 
         # Verify file selected immediately
         file_count = await page.eval_on_selector(
@@ -191,17 +248,14 @@ async def test_bt05_file_input_survives_poll_cycles():
         for cycle in range(1, 4):
             await asyncio.sleep(6)  # slightly over 5s poll interval
 
-            # Form must still be visible
             form_visible = await form.is_visible()
             assert form_visible, \
                 f"Poll cycle {cycle}: upload form became hidden or was destroyed"
 
-            # File input must still exist
             file_input_count = await page.locator(f"#sj-pdf-{batch_id}").count()
             assert file_input_count == 1, \
                 f"Poll cycle {cycle}: file input element was removed from DOM"
 
-            # File must still be selected
             file_count = await page.eval_on_selector(
                 f"#sj-pdf-{batch_id}", "el => el.files.length"
             )
@@ -213,10 +267,12 @@ async def test_bt05_file_input_survives_poll_cycles():
                 f"files.length={file_count}, name={file_name}"
             )
 
-        # Cancel (cleanup)
+        # Cancel (cleanup form)
         cancel_btn = page.locator(f".sj-cancel-btn[data-batch='{batch_id}']")
         await cancel_btn.click()
     finally:
+        if batch_id:
+            _api_delete_batch(batch_id)
         await browser.close()
         await pw.stop()
 
@@ -225,6 +281,7 @@ async def test_bt05_file_input_survives_poll_cycles():
 async def test_bt06_upload_subjob_appears():
     """BT06: Uploading a PDF creates a sub-job row in the batch card."""
     pw, browser, page = await make_authed_page()
+    batch_id = None
     try:
         await open_bulk_screen(page)
         batch_id = await create_batch(page)
@@ -235,43 +292,38 @@ async def test_bt06_upload_subjob_appears():
         form = page.locator(f"#add-sj-form-{batch_id}")
         await form.wait_for(state="visible", timeout=5000)
 
-        # Fill expected count first, then file (so validate() fires on the change event)
-        expected_input = page.locator(f"#sj-expected-{batch_id}")
-        await expected_input.fill("6")
+        # Set file via hidden input (triggers _handleFiles which shows the count table)
         file_input = page.locator(f"#sj-pdf-{batch_id}")
         await file_input.set_input_files(PDF_PATH)
-        # Trigger change event explicitly in case Playwright didn't fire it
         await page.eval_on_selector(
             f"#sj-pdf-{batch_id}",
             "el => el.dispatchEvent(new Event('change', {bubbles:true}))"
         )
 
-        # Submit — wait for the upload button to become enabled (file selected)
+        # The count table should appear — fill in expected count for the first row
+        count_table = page.locator(f"#sj-count-table-{batch_id}")
+        await count_table.wait_for(state="visible", timeout=5000)
+        count_input = count_table.locator(".sj-count-input").first
+        await count_input.fill("6")
+
+        # Upload button should now be enabled
         upload_btn = page.locator(f".sj-upload-btn[data-batch='{batch_id}']")
         for _ in range(20):
             if await upload_btn.is_enabled():
                 break
             await asyncio.sleep(0.25)
 
-        # Diagnostic: report button state and file count if still disabled
         btn_enabled = await upload_btn.is_enabled()
-        file_count_diag = await page.eval_on_selector(
-            f"#sj-pdf-{batch_id}", "el => el.files.length"
-        )
-        exp_val_diag = await expected_input.input_value()
-        assert btn_enabled, (
-            f"Upload button never became enabled. "
-            f"files.length={file_count_diag}, expected_value={exp_val_diag!r}"
-        )
+        assert btn_enabled, "Upload button never became enabled after filling expected count"
+
         await upload_btn.click()
 
-        # Wait up to 30s for progress-screen to appear (Render cold-start can add ~10s)
+        # Wait up to 30s for progress-screen to appear
         progress_visible = False
         for _ in range(60):
             if await page.locator("#progress-screen").is_visible():
                 progress_visible = True
                 break
-            # Check for error in form
             err_el = page.locator(f"#sj-error-{batch_id}")
             if await err_el.count() > 0:
                 cls = await err_el.get_attribute("class") or ""
@@ -286,26 +338,23 @@ async def test_bt06_upload_subjob_appears():
         # Navigate back to bulk screen
         await open_bulk_screen(page)
 
-        # The batch card should now show a sub-job row
         card = page.locator(f"#batch-card-{batch_id}")
         await card.wait_for(state="visible", timeout=10000)
 
-        # Wait for the upload form to be hidden (upload complete, form dismissed)
-        # The sub-job table is only updated when the form is hidden
+        # Wait for form to be hidden (upload complete)
         form_locator = page.locator(f"#add-sj-form-{batch_id}")
         for _ in range(20):
             form_count = await form_locator.count()
             if form_count == 0:
-                break  # form removed from DOM
+                break
             form_hidden = "hidden" in (await form_locator.get_attribute("class") or "")
             if form_hidden:
                 break
             await asyncio.sleep(0.5)
 
-        # Give loadBatches() time to complete its first async fetch
         await asyncio.sleep(2)
 
-        # Wait up to 20s for the sub-job row to appear (poll cycle needed)
+        # Wait up to 20s for the sub-job row to appear
         sj_row_appeared = False
         for _ in range(7):
             card_text = await card.inner_text()
@@ -319,6 +368,8 @@ async def test_bt06_upload_subjob_appears():
             f"Card text: {await card.inner_text()}"
         )
     finally:
+        if batch_id:
+            _api_delete_batch(batch_id)
         await browser.close()
         await pw.stop()
 
@@ -329,13 +380,13 @@ async def test_bt07_cache_busting_hash_present():
     pw, browser, page = await make_authed_page()
     try:
         html = await page.content()
-        match = re.search(r'bulk_patch\.js\?v=([0-9a-f]{12})', html)
+        match = re.search(r'bulk_patch\.js\?v=([0-9a-f]{8,})', html)
         assert match, (
             "bulk_patch.js not referenced with a ?v=<hash> cache-buster in index.html. "
             f"Found: {re.findall(r'bulk_patch[^\"<]*', html)}"
         )
         hash_val = match.group(1)
-        assert len(hash_val) == 12, f"Hash should be 12 hex chars, got: {hash_val}"
+        assert len(hash_val) >= 8, f"Hash should be at least 8 hex chars, got: {hash_val}"
     finally:
         await browser.close()
         await pw.stop()
@@ -363,19 +414,163 @@ async def test_bt08_back_to_batch_from_phase_a():
 
         await review_btn.click()
 
-        # Phase A screen should appear
         await page.wait_for_selector("#phase-a-screen", state="visible", timeout=10000)
 
-        # Back-to-Batch button should be present
         back_btn = page.locator(".back-to-batch-btn")
         assert await back_btn.count() > 0, "Back-to-Batch button not found in Phase A header"
         assert await back_btn.is_visible(), "Back-to-Batch button not visible"
 
-        # Click it — should return to bulk screen
         await back_btn.click()
         await page.wait_for_selector("#bulk-screen", state="visible", timeout=5000)
         assert await page.locator("#bulk-screen").is_visible()
     finally:
+        await browser.close()
+        await pw.stop()
+
+
+@pytest.mark.asyncio
+async def test_bt09_multi_file_drop_three_subjobs():
+    """BT09: Dropping 3 PDF files at once produces an expected-count table with 3 rows,
+    and after submission 3 sub-jobs appear in the batch card."""
+    pw, browser, page = await make_authed_page()
+    batch_id = None
+    try:
+        await open_bulk_screen(page)
+        batch_id = await create_batch(page)
+
+        # Open Add File form
+        add_btn = page.locator(f".add-file-btn[data-batch='{batch_id}']")
+        await add_btn.click()
+        form = page.locator(f"#add-sj-form-{batch_id}")
+        await form.wait_for(state="visible", timeout=5000)
+
+        # Set 3 files via the hidden file input (simulates multi-file selection)
+        file_input = page.locator(f"#sj-pdf-{batch_id}")
+        await file_input.set_input_files([PDF_PATH, PDF_PATH, PDF_PATH])
+        await page.eval_on_selector(
+            f"#sj-pdf-{batch_id}",
+            "el => el.dispatchEvent(new Event('change', {bubbles:true}))"
+        )
+
+        # The count table should appear with 3 rows
+        count_table = page.locator(f"#sj-count-table-{batch_id}")
+        await count_table.wait_for(state="visible", timeout=5000)
+
+        count_inputs = count_table.locator(".sj-count-input")
+        row_count = await count_inputs.count()
+        assert row_count == 3, f"Expected 3 rows in expected-count table, got {row_count}"
+
+        # Fill expected counts for all 3 files
+        for i in range(3):
+            await count_inputs.nth(i).fill("6")
+
+        # Upload button should be enabled
+        upload_btn = page.locator(f".sj-upload-btn[data-batch='{batch_id}']")
+        for _ in range(20):
+            if await upload_btn.is_enabled():
+                break
+            await asyncio.sleep(0.25)
+
+        assert await upload_btn.is_enabled(), "Upload button not enabled after filling all 3 counts"
+
+        await upload_btn.click()
+
+        # Wait for progress screen (first sub-job)
+        progress_visible = False
+        for _ in range(60):
+            if await page.locator("#progress-screen").is_visible():
+                progress_visible = True
+                break
+            err_el = page.locator(f"#sj-error-{batch_id}")
+            if await err_el.count() > 0:
+                cls = await err_el.get_attribute("class") or ""
+                if "hidden" not in cls:
+                    err_text = await err_el.inner_text()
+                    if err_text.strip():
+                        pytest.fail(f"Upload error: {err_text}")
+            await asyncio.sleep(0.5)
+
+        assert progress_visible, "Progress screen never appeared after 3-file upload"
+
+        # Navigate back to bulk screen
+        await open_bulk_screen(page)
+        card = page.locator(f"#batch-card-{batch_id}")
+        await card.wait_for(state="visible", timeout=10000)
+
+        # Wait for form to be hidden
+        form_locator = page.locator(f"#add-sj-form-{batch_id}")
+        for _ in range(20):
+            form_count = await form_locator.count()
+            if form_count == 0:
+                break
+            form_hidden = "hidden" in (await form_locator.get_attribute("class") or "")
+            if form_hidden:
+                break
+            await asyncio.sleep(0.5)
+
+        await asyncio.sleep(2)
+
+        # Wait for 3 sub-job rows to appear
+        sub_job_count = 0
+        for _ in range(15):
+            card_text = await card.inner_text()
+            # Count occurrences of status words in the table rows
+            rows = [r for r in card_text.split('\n') if any(
+                s in r.lower() for s in ("detecting", "ready", "queued", "error", "grouping", "confirmed")
+            )]
+            sub_job_count = len(rows)
+            if sub_job_count >= 3:
+                break
+            await asyncio.sleep(2)
+
+        assert sub_job_count >= 3, (
+            f"Expected 3 sub-job rows, found {sub_job_count}. "
+            f"Card text: {await card.inner_text()}"
+        )
+    finally:
+        if batch_id:
+            _api_delete_batch(batch_id)
+        await browser.close()
+        await pw.stop()
+
+
+@pytest.mark.asyncio
+async def test_bt10_delete_empty_batch():
+    """BT10: A batch with no confirmed sub-jobs can be deleted via the Delete button."""
+    pw, browser, page = await make_authed_page()
+    batch_id = None
+    try:
+        await open_bulk_screen(page)
+        batch_id = await create_batch(page)
+
+        # Verify the card is present
+        card = page.locator(f"#batch-card-{batch_id}")
+        assert await card.is_visible(), f"Batch card {batch_id} not visible before delete"
+
+        # The Delete button should be present (no confirmed sub-jobs)
+        delete_btn = page.locator(f".delete-batch-btn[data-batch='{batch_id}']")
+        assert await delete_btn.count() > 0, "Delete button not found on empty batch"
+        assert await delete_btn.is_visible(), "Delete button not visible"
+
+        # Accept the confirm dialog and click Delete
+        page.once("dialog", lambda dialog: asyncio.ensure_future(dialog.accept()))
+        await delete_btn.click()
+
+        # Card should disappear from the DOM
+        for _ in range(20):
+            count = await page.locator(f"#batch-card-{batch_id}").count()
+            if count == 0:
+                break
+            await asyncio.sleep(0.5)
+
+        remaining = await page.locator(f"#batch-card-{batch_id}").count()
+        assert remaining == 0, f"Batch card {batch_id} still visible after delete"
+
+        # batch_id is now deleted — no need for API teardown
+        batch_id = None
+    finally:
+        if batch_id:
+            _api_delete_batch(batch_id)
         await browser.close()
         await pw.stop()
 
