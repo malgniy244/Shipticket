@@ -182,7 +182,7 @@ def _register_batch_routes(app, *, jobs, jobs_lock, batches, batches_lock,
                             batch_ledger_summary, schedule_cleanup,
                             JOB_TTL_SECONDS, parse_whitelist,
                             run_detection_background, persist_snapshot,
-                            build_zip):
+                            build_zip, load_snapshot=None):
     """
     Register all batch routes onto the FastAPI app with real implementations.
     Called from main.py after all helpers are defined.
@@ -616,46 +616,65 @@ def _register_batch_routes(app, *, jobs, jobs_lock, batches, batches_lock,
         if not batch:
             raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found")
 
-        with jobs_lock:
-            job = jobs.get(sub_job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Sub-job {sub_job_id} not found")
-        if job.get("batch_id") != batch_id:
-            raise HTTPException(status_code=409, detail="Sub-job does not belong to this batch")
-        if job["status"] != "confirmed":
+        # Verify this sub-job belongs to this batch (check batch sub_jobs list)
+        sj_summary = next((sj for sj in batch.get("sub_jobs", []) if sj["id"] == sub_job_id), None)
+        if not sj_summary:
+            raise HTTPException(status_code=404, detail=f"Sub-job {sub_job_id} not found in batch {batch_id}")
+        if sj_summary.get("status") != "confirmed":
             raise HTTPException(
                 status_code=409,
-                detail=f"Sub-job is not confirmed (status={job['status']})",
+                detail=f"Sub-job is not confirmed (status={sj_summary.get('status')})",
             )
 
-        # Release tickets from ledger
-        snap = job.get("confirmed_snapshot") or {}
+        # Get the ticket list from in-memory job or persisted snapshot
+        with jobs_lock:
+            job = jobs.get(sub_job_id)
+        snap = None
+        if job:
+            snap = job.get("confirmed_snapshot") or {}
+        if not snap and load_snapshot:
+            snap = load_snapshot(sub_job_id) or {}
         released_tickets = list(snap.get("whitelist", []))
+
+        # Release tickets from ledger
         with batches_lock:
             for t in released_tickets:
                 if batch["claimed_tickets"].get(t) == sub_job_id:
                     del batch["claimed_tickets"][t]
             for i, sj in enumerate(batch["sub_jobs"]):
                 if sj["id"] == sub_job_id:
-                    batch["sub_jobs"][i]["status"] = "ready"
+                    # If job is still in memory it can be re-reviewed; otherwise mark abandoned
+                    # so the user knows they need to re-upload
+                    new_status = "ready" if job else "abandoned"
+                    batch["sub_jobs"][i]["status"] = new_status
                     break
             # If batch was complete, reopen it
             if batch["status"] == "complete":
                 batch["status"] = "open"
 
-        with jobs_lock:
-            job["status"] = "ready"
-            job["confirmed_snapshot"] = None
-            job["zip_path"] = None
+        # Also delete the batch-level ZIP copy so it isn't included in future downloads
+        batch_sj_zip = BATCHES_ROOT / batch_id / f"{sub_job_id}.zip"
+        if batch_sj_zip.exists():
+            try:
+                batch_sj_zip.unlink()
+            except Exception:
+                pass
 
-        persist_job(sub_job_id)
+        if job:
+            with jobs_lock:
+                job["status"] = "ready"
+                job["confirmed_snapshot"] = None
+                job["zip_path"] = None
+            persist_job(sub_job_id)
+
         persist_batch(batch_id)
-        log.info("Sub-job %s un-confirmed in batch %s (released tickets: %s)",
-                 sub_job_id, batch_id, released_tickets)
+        final_status = "ready" if job else "abandoned"
+        log.info("Sub-job %s un-confirmed in batch %s (released tickets: %s, new_status: %s)",
+                 sub_job_id, batch_id, released_tickets, final_status)
         return {
             "ok": True,
             "sub_job_id": sub_job_id,
-            "status": "ready",
+            "status": final_status,
             "released_tickets": released_tickets,
         }
 

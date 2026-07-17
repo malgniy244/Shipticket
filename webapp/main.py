@@ -1380,6 +1380,7 @@ _register_batch_routes(
     run_detection_background=run_detection_background,
     persist_snapshot=persist_snapshot,
     build_zip=_build_zip,
+    load_snapshot=load_snapshot,
 )
 
 # ── Static files (HTML/JS/CSS) ────────────────────────────────────────────────
