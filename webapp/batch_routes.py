@@ -721,6 +721,8 @@ def _register_batch_routes(app, *, jobs, jobs_lock, batches, batches_lock,
     async def _archive_batch(batch_id: str, _=Depends(require_session)):
         """
         Archive a batch: hidden from the default list but not deleted.
+        Also removes the per-sub-job ZIP copies from the batch directory to
+        free disk space (the batch state.json is preserved for audit).
         Can be reversed via POST /api/batches/{id}/unarchive.
         """
         with batches_lock:
@@ -730,7 +732,27 @@ def _register_batch_routes(app, *, jobs, jobs_lock, batches, batches_lock,
         with batches_lock:
             batches[batch_id]["archived"] = True
         persist_batch(batch_id)
-        log.info("Batch %s archived", batch_id)
+
+        # Delete per-sub-job ZIP copies to free disk space
+        batch_dir = BATCHES_ROOT / batch_id
+        freed_bytes = 0
+        for sj in batch.get("sub_jobs", []):
+            sj_zip = batch_dir / f"{sj['id']}.zip"
+            if sj_zip.exists():
+                try:
+                    freed_bytes += sj_zip.stat().st_size
+                    sj_zip.unlink()
+                except Exception as exc:
+                    log.warning("Batch %s: failed to delete sub-job ZIP %s: %s", batch_id, sj_zip, exc)
+        # Also remove the merged batch_tickets.zip if present
+        merged_zip = batch_dir / "batch_tickets.zip"
+        if merged_zip.exists():
+            try:
+                freed_bytes += merged_zip.stat().st_size
+                merged_zip.unlink()
+            except Exception:
+                pass
+        log.info("Batch %s archived (freed ~%d KB of ZIP files)", batch_id, freed_bytes // 1024)
         return {"ok": True, "batch_id": batch_id, "archived": True}
 
     @r.post("/{batch_id}/unarchive")
