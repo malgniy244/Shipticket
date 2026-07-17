@@ -533,14 +533,15 @@ def _register_batch_routes(app, *, jobs, jobs_lock, batches, batches_lock,
         log.info("Sub-job %s confirmed in batch %s (tickets=%s)",
                  sub_job_id, batch_id, sorted(assigned_tickets))
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"tickets_{timestamp}.zip"
-        return FileResponse(
-            zip_path,
-            media_type="application/zip",
-            filename=filename,
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-        )
+        # Return JSON — the ZIP is stored at job["zip_path"] and served by the batch download endpoint.
+        # Per-file download is not available for bulk sub-jobs.
+        return {
+            "status": "confirmed",
+            "sub_job_id": sub_job_id,
+            "batch_id": batch_id,
+            "tickets_claimed": sorted(assigned_tickets),
+            "ledger": batch_ledger_summary(batch),
+        }
 
     # ── POST /api/batches/{batch_id}/sub-jobs/{sub_job_id}/abandon ────────────
 

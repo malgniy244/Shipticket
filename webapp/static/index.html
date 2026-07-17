@@ -1163,33 +1163,55 @@ function buildReconcileScreen() {
 
   // Three checks
   const assignedTickets = new Set(finalBlocks.map(b=>b.ticket).filter(Boolean));
-  const missing = wl.filter(t => !assignedTickets.has(t));
-  const duplicates = wl.filter(t => (ticketToBlocks[t]||[]).length > 1);
+  // For bulk sub-jobs: "missing" means assigned count != expected_count (not wl-based)
+  const _isBulkSJCheck = typeof activeSubJobId !== 'undefined' && !!activeSubJobId;
+  const _bulkExpCheck = (_isBulkSJCheck && typeof activeSubJobExpectedCount !== 'undefined' && activeSubJobExpectedCount != null)
+    ? activeSubJobExpectedCount : null;
+  const missing = _bulkExpCheck != null
+    ? [] // bulk: no per-ticket missing list; count check is done separately
+    : wl.filter(t => !assignedTickets.has(t));
+  const duplicates = Array.from(assignedTickets).filter(t => (ticketToBlocks[t]||[]).length > 1);
   const extras = finalBlocks.filter(b => b.ticket && !wl.includes(b.ticket));
   const allConfirmed = finalBlocks.every(b => pbConfirmed[b.id]);
+  const countOk = _bulkExpCheck != null ? assignedTickets.size === _bulkExpCheck : missing.length === 0;
 
-  const checkMissing = missing.length === 0;
+  const checkMissing = countOk;
   const checkDupes = duplicates.length === 0;
   const checkExtras = extras.length === 0;
   const allPass = checkMissing && checkDupes && checkExtras && allConfirmed;
 
   // Render checks
+  const missingPill = _bulkExpCheck != null
+    ? (countOk ? '\u2713 Ticket count correct' : `\u2717 Expected ${_bulkExpCheck}, got ${assignedTickets.size}`)
+    : (checkMissing ? '\u2713 No missing tickets' : '\u2717 Missing: '+missing.join(', '));
   el('reconcile-checks').innerHTML = `
-    <span class="check-pill ${checkMissing?'pass':'fail'}">${checkMissing?'\u2713 No missing tickets':'\u2717 Missing: '+missing.join(', ')}</span>
+    <span class="check-pill ${checkMissing?'pass':'fail'}">${missingPill}</span>
     <span class="check-pill ${checkDupes?'pass':'fail'}">${checkDupes?'\u2713 No duplicates':'\u2717 Duplicates: '+duplicates.join(', ')}</span>
     <span class="check-pill ${checkExtras?'pass':'fail'}">${checkExtras?'\u2713 No extras':'\u2717 Extra tickets: '+extras.map(b=>b.ticket).join(', ')}</span>
     <span class="check-pill ${allConfirmed?'pass':'fail'}">${allConfirmed?'\u2713 All blocks confirmed':'\u2717 Unconfirmed blocks remain'}</span>
   `;
 
   const confirmedCount = finalBlocks.filter(b=>pbConfirmed[b.id]).length;
-  el('reconcile-title').textContent = allPass ? '\u2713 Batch Complete' : '\u26a0 Batch Incomplete';
+  // For bulk sub-jobs use this file's expected_count; for single-file use wl.length
+  const _isBulkSJ = typeof activeSubJobId !== 'undefined' && !!activeSubJobId;
+  const _bulkExp = (_isBulkSJ && typeof activeSubJobExpectedCount !== 'undefined' && activeSubJobExpectedCount != null)
+    ? activeSubJobExpectedCount : null;
+  const _displayExpected = _bulkExp != null ? _bulkExp : wl.length;
+  const _fileAllPass = _bulkExp != null
+    ? (assignedTickets.size === _bulkExp && checkDupes && checkExtras && allConfirmed)
+    : allPass;
+  el('reconcile-title').textContent = _fileAllPass ? '\u2713 File Complete' : '\u26a0 File Incomplete';
   el('reconcile-headline').textContent =
-    `${wl.length} ticket${wl.length!==1?'s':''} expected \u00b7 ${confirmedCount} block${confirmedCount!==1?'s':''} confirmed \u00b7 ` +
-    (allPass ? 'every ticket matched exactly once \u2713' : 'issues found \u2014 review below');
+    `${_displayExpected} ticket${_displayExpected!==1?'s':''} expected \u00b7 ${confirmedCount} block${confirmedCount!==1?'s':''} confirmed \u00b7 ` +
+    (_fileAllPass ? 'every ticket matched exactly once \u2713' : 'issues found \u2014 review below');
 
   // Build table
   const tbody = el('reconcile-tbody'); tbody.innerHTML='';
-  wl.forEach((t, i) => {
+  // For bulk sub-jobs: only show assigned tickets (not the full batch whitelist)
+  const _tableTickets = _bulkExpCheck != null
+    ? Array.from(assignedTickets).sort()
+    : wl;
+  _tableTickets.forEach((t, i) => {
     const matchedBlocks = ticketToBlocks[t] || [];
     const isDupe = matchedBlocks.length > 1;
     const isMissing = matchedBlocks.length === 0;
@@ -1243,11 +1265,31 @@ function buildReconcileScreen() {
     tbody.appendChild(tr);
   });
 
-  // Download button
-  el('final-confirm-btn').disabled = !allPass;
-  el('reconcile-status-text').textContent = allPass
-    ? 'All checks pass. Ready to download.'
-    : 'Resolve all issues above before downloading.';
+  // Download button — for bulk sub-jobs, relabel and use expected_count for the check
+  // (activeSubJobId and activeSubJobExpectedCount are set by bulk_patch.js)
+  const isBulkSubJob = typeof activeSubJobId !== 'undefined' && !!activeSubJobId;
+  const bulkExpected = (typeof activeSubJobExpectedCount !== 'undefined' && activeSubJobExpectedCount != null)
+    ? activeSubJobExpectedCount : null;
+
+  if (isBulkSubJob) {
+    // For bulk sub-jobs, the confirm check is: assigned tickets == expected_count
+    const assignedCount = assignedTickets.size;
+    const countOk = bulkExpected != null ? assignedCount === bulkExpected : true;
+    const bulkAllPass = countOk && checkDupes && checkExtras && allConfirmed;
+    el('final-confirm-btn').disabled = !bulkAllPass;
+    el('final-confirm-btn').textContent = 'Confirm File';
+    el('reconcile-status-text').textContent = bulkAllPass
+      ? `All checks pass. ${assignedCount} ticket${assignedCount!==1?'s':''} will be claimed in the batch ledger.`
+      : bulkExpected != null && !countOk
+        ? `Expected ${bulkExpected} ticket${bulkExpected!==1?'s':''} but ${assignedCount} assigned. Adjust blocks before confirming.`
+        : 'Resolve all issues above before confirming.';
+  } else {
+    el('final-confirm-btn').disabled = !allPass;
+    el('final-confirm-btn').textContent = 'Confirm & Download ZIP';
+    el('reconcile-status-text').textContent = allPass
+      ? 'All checks pass. Ready to download.'
+      : 'Resolve all issues above before downloading.';
+  }
 
   showReconcileScreen();
 }

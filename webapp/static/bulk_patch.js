@@ -4,6 +4,7 @@
 // ── Bulk Mode state ──
 let activeBatchId = null;       // batch currently being reviewed in sub-job flow
 let activeSubJobId = null;      // sub-job currently in Phase A/B review
+let activeSubJobExpectedCount = null; // this file's expected ticket count (not the batch total)
 let batchPollTimer = null;      // setInterval handle for dashboard refresh
 let nbBatchType = null;         // new-batch form: selected batch type
 let _showArchived = false;      // toggle: show archived batches in dashboard
@@ -400,6 +401,9 @@ function _reviewSubJob(batchId, sjId) {
       whitelist = batchData.whitelist;
       batchType = batchData.batch_type;
       activeJobFastMode = !!batchData.fast_mode;
+      // Get this sub-job's expected_count from the batch sub_jobs list
+      const sjSummary = (batchData.sub_jobs || []).find(s => s.id === sjId);
+      activeSubJobExpectedCount = sjSummary ? (sjSummary.expected_count || null) : null;
       return api('GET', `/api/jobs/${sjId}/review`);
     })
     .then(rs => {
@@ -532,6 +536,7 @@ function attachBatchCardListeners(b) {
       // Navigate into the first sub-job's review flow
       activeBatchId = batchId;
       activeSubJobId = firstSubJobData.sub_job_id;
+      activeSubJobExpectedCount = firstSubJobData.expected_count || null;
       jobId = firstSubJobData.sub_job_id;
       totalPages = firstSubJobData.total_pages;
       whitelist = firstSubJobData.whitelist;
@@ -568,53 +573,61 @@ function attachBatchCardListeners(b) {
 })();
 
 // ── Sub-job confirm: override the final-confirm-btn for sub-job flow ──
+// For bulk sub-jobs: call the batch confirm endpoint (returns JSON + claims ledger),
+// then navigate back to the batch dashboard. No per-file ZIP download.
 el('final-confirm-btn').addEventListener('click', async function(e) {
-  if (!activeSubJobId) return; // handled by original listener
+  if (!activeSubJobId) return; // not a bulk sub-job — let the original listener handle it
   e.stopImmediatePropagation();
   el('final-confirm-btn').disabled = true;
-  el('final-confirm-btn').innerHTML = '<span class="spinner"></span>Building ZIP…';
+  el('final-confirm-btn').innerHTML = '<span class="spinner"></span>Confirming…';
   try {
-    const fd = new FormData();
-    const r = await fetch(`/api/batches/${activeBatchId}/sub-jobs/${activeSubJobId}/confirm`, {method:'POST', body: fd});
+    const r = await fetch(`/api/batches/${activeBatchId}/sub-jobs/${activeSubJobId}/confirm`, {method:'POST'});
     if (!r.ok) {
       const t = await r.text();
-      throw new Error(t.startsWith('<') ? 'Server error (unexpected HTML response)' : t);
+      let msg = t;
+      try { const j = JSON.parse(t); msg = j.detail || j.message || t; } catch(_) {}
+      throw new Error(msg.startsWith('<') ? 'Server error (unexpected HTML response)' : msg);
     }
-    const blob = await r.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a'); a.href = url;
-    const cd = r.headers.get('Content-Disposition') || '';
-    const m = cd.match(/filename="([^"]+)"/);
-    a.download = m ? m[1] : 'tickets.zip';
-    a.click();
-    el('final-confirm-btn').textContent = '\u2713 Downloaded';
-    el('reconcile-status-text').textContent = 'ZIP downloaded. Return to batch dashboard to continue.';
-    // Add "Back to Batch" button
-    const backBtn = document.createElement('button');
-    backBtn.className = 'btn-outline';
-    backBtn.style.cssText = 'margin-left:12px;';
-    backBtn.textContent = '\u2190 Back to Batch';
-    backBtn.addEventListener('click', () => {
-      activeSubJobId = null;
-      jobId = null;
-      reviewState = null;
-      hideReconcileScreen();
-      showBulkScreen();
-    });
-    el('final-confirm-btn').parentNode.appendChild(backBtn);
-  } catch(e) {
-    alert('Download failed: ' + e.message);
+    const data = await r.json();
+    // Tickets claimed — navigate back to batch dashboard
+    const batchId = activeBatchId;
+    activeSubJobId = null;
+    activeSubJobExpectedCount = null;
+    jobId = null;
+    reviewState = null;
+    hideReconcileScreen();
+    showBulkScreen();
+    // loadBatches() is called by showBulkScreen() — the ledger will update automatically
+  } catch(err) {
+    alert('Confirm failed: ' + err.message);
     el('final-confirm-btn').disabled = false;
-    el('final-confirm-btn').textContent = 'Confirm & Download ZIP';
+    el('final-confirm-btn').textContent = 'Confirm Boundaries →';
   }
 }, true); // capture phase so it fires before the original listener
 
-// ── Back-to-batch from Phase A ──
+// ── Phase A counter: use this file's expected_count, not the batch whitelist length ──
 (function() {
-  const orig = buildPhaseA;
+  const origRender = window.renderPhaseA || (typeof renderPhaseA !== 'undefined' ? renderPhaseA : null);
+  // We patch renderPhaseA after it's defined by overriding the counter update.
+  // The cleanest approach: override the counter element text after orig() runs.
+  const origBuildPhaseA = buildPhaseA;
   window.buildPhaseA = function() {
-    orig();
-    if (activeSubJobId) {
+    origBuildPhaseA();
+    // Patch the boundary counter to use this file's expected_count
+    if (activeSubJobId && activeSubJobExpectedCount != null) {
+      const expected = activeSubJobExpectedCount - 1; // N tickets → N-1 splits
+      const actual = boundaries.length - 1;
+      const counter = el('phase-a-boundary-counter');
+      if (counter) {
+        if (actual === expected) {
+          counter.innerHTML = `<span style="color:var(--success);font-weight:600">&#10003; ${actual} of ${expected} splits placed (${activeSubJobExpectedCount} tickets)</span>`;
+        } else {
+          const diff = expected - actual;
+          const msg = diff > 0 ? `${diff} split${diff>1?'s':''} missing` : `${-diff} extra split${-diff>1?'s':''}`;
+          counter.innerHTML = `<span style="color:var(--danger);font-weight:600">&#9888; ${actual} of ${expected} splits placed &mdash; ${msg} (${activeSubJobExpectedCount} tickets expected)</span>`;
+        }
+      }
+      // Also inject Back-to-Batch button
       const header = document.querySelector('.phase-header');
       if (header && !header.querySelector('.back-to-batch-btn')) {
         const btn = document.createElement('button');
@@ -623,6 +636,7 @@ el('final-confirm-btn').addEventListener('click', async function(e) {
         btn.textContent = '\u2190 Back to Batch';
         btn.addEventListener('click', () => {
           activeSubJobId = null;
+          activeSubJobExpectedCount = null;
           jobId = null;
           reviewState = null;
           hide('phase-a-screen');
@@ -632,4 +646,26 @@ el('final-confirm-btn').addEventListener('click', async function(e) {
       }
     }
   };
+
+  // Use a MutationObserver on the counter element so every divider click (which calls
+  // renderPhaseA internally) gets the corrected expected count.
+  const counterEl = el('phase-a-boundary-counter');
+  if (counterEl) {
+    const obs = new MutationObserver(() => {
+      if (!activeSubJobId || activeSubJobExpectedCount == null) return;
+      // Prevent re-entrant firing
+      obs.disconnect();
+      const expected = activeSubJobExpectedCount - 1;
+      const actual = boundaries.length - 1;
+      if (actual === expected) {
+        counterEl.innerHTML = `<span style="color:var(--success);font-weight:600">&#10003; ${actual} of ${expected} splits placed (${activeSubJobExpectedCount} tickets)</span>`;
+      } else {
+        const diff = expected - actual;
+        const msg = diff > 0 ? `${diff} split${diff>1?'s':''} missing` : `${-diff} extra split${-diff>1?'s':''}`;
+        counterEl.innerHTML = `<span style="color:var(--danger);font-weight:600">&#9888; ${actual} of ${expected} splits placed &mdash; ${msg} (${activeSubJobExpectedCount} tickets expected)</span>`;
+      }
+      obs.observe(counterEl, {childList: true, subtree: true, characterData: true});
+    });
+    obs.observe(counterEl, {childList: true, subtree: true, characterData: true});
+  }
 })();

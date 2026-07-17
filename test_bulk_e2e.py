@@ -146,10 +146,9 @@ def upload_sub_job(batch_id: str, expected_count: int = None) -> dict:
 def confirm_sub_job(batch_id: str, sub_job_id: str) -> bytes:
     r = client.post(
         f"/api/batches/{batch_id}/sub-jobs/{sub_job_id}/confirm",
-        data={},
     )
     assert r.status_code == 200, f"confirm failed ({r.status_code}): {r.text}"
-    return r.content
+    return r.json()
 
 
 # ── Tests ──────────────────────────────────────────────────────────────────────
@@ -267,12 +266,15 @@ class TestBulkSubJobConfirm:
         d = upload_sub_job(self.batch_id)
         self.sj_id = d["sub_job_id"]
 
-    def test_confirm_sub_job_returns_zip(self):
-        zip_bytes = confirm_sub_job(self.batch_id, self.sj_id)
-        assert len(zip_bytes) > 0
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            names = zf.namelist()
-        assert len(names) > 0
+    def test_confirm_sub_job_returns_json_ledger(self):
+        # Confirm now returns JSON (ledger update), not a ZIP.
+        # The ZIP is built internally and served only via the batch download endpoint.
+        data = confirm_sub_job(self.batch_id, self.sj_id)
+        assert data["status"] == "confirmed"
+        assert "tickets_claimed" in data
+        assert len(data["tickets_claimed"]) == len(GT["whitelist"])
+        assert "ledger" in data
+        assert data["ledger"]["total_claimed"] == len(GT["whitelist"])
 
     def test_confirm_updates_batch_ledger(self):
         confirm_sub_job(self.batch_id, self.sj_id)

@@ -1153,6 +1153,17 @@ async def confirm_job(job_id: str, _=Depends(require_session)):
     if job["status"] not in ("ready",):
         raise HTTPException(status_code=409, detail="Job not ready to confirm")
 
+    # Bulk sub-jobs must be confirmed via the batch endpoint, not this one.
+    if job.get("batch_id"):
+        raise HTTPException(
+            status_code=403,
+            detail=json.dumps({
+                "error": "bulk_sub_job",
+                "message": "Use POST /api/batches/{batch_id}/sub-jobs/{sub_job_id}/confirm for bulk sub-jobs",
+                "batch_id": job["batch_id"],
+            }),
+        )
+
     review = job["review_state"]
     blocks = review["blocks"]
     wl: list[str] = review.get("whitelist", job.get("whitelist", []))
