@@ -495,7 +495,8 @@ function _handleFiles(batchId, files) {
 function attachBatchCardListeners(b) {
   const batchId = b.batch_id;
   _initDropzone(batchId);
-  _attachActionsListeners(document.getElementById(`batch-card-${batchId}`), b);
+  // Note: _attachActionsListeners is called by _updateBatchCardDynamic, so we do NOT
+  // call it here to avoid double-attaching listeners (which would double-toggle the form).
 
   // Upload button: submit all pending files sequentially
   const uploadBtn = document.querySelector(`.sj-upload-btn[data-batch="${batchId}"]`);
