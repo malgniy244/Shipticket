@@ -602,7 +602,10 @@ el('final-confirm-btn').addEventListener('click', async function(e) {
     reviewState = null;
     hideReconcileScreen();
     showBulkScreen();
-    // loadBatches() is called by showBulkScreen() — the ledger will update automatically
+    // showBulkScreen() calls loadBatches() immediately, but the server may still be
+    // persisting the confirm. Fire a second refresh after 800ms to ensure the
+    // Download button appears without needing to wait for the 5s poll cycle.
+    setTimeout(loadBatches, 800);
   } catch(err) {
     alert('Confirm failed: ' + err.message);
     el('final-confirm-btn').disabled = false;
