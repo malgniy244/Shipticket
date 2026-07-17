@@ -598,6 +598,45 @@ def _register_batch_routes(app, *, jobs, jobs_lock, batches, batches_lock,
         log.info("Sub-job %s abandoned in batch %s", sub_job_id, batch_id)
         return {"ok": True, "sub_job_id": sub_job_id, "status": "abandoned"}
 
+    # ── DELETE /api/batches/{batch_id}/sub-jobs/{sub_job_id} ─────────────────────
+
+    @r.delete("/{batch_id}/sub-jobs/{sub_job_id}")
+    async def _remove_sub_job(
+        batch_id: str,
+        sub_job_id: str,
+        _=Depends(require_session),
+    ):
+        """
+        Permanently remove an abandoned sub-job from the batch.
+        Only allowed for sub-jobs with status 'abandoned'.
+        """
+        with batches_lock:
+            batch = batches.get(batch_id)
+        if not batch:
+            raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found")
+
+        sj_summary = next((sj for sj in batch.get("sub_jobs", []) if sj["id"] == sub_job_id), None)
+        if not sj_summary:
+            raise HTTPException(status_code=404, detail=f"Sub-job {sub_job_id} not found in batch {batch_id}")
+        if sj_summary.get("status") != "abandoned":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Can only remove abandoned sub-jobs (status={sj_summary.get('status')}). Un-confirm or abandon first.",
+            )
+
+        # Remove from batch sub_jobs list
+        with batches_lock:
+            batch["sub_jobs"] = [sj for sj in batch["sub_jobs"] if sj["id"] != sub_job_id]
+            batch["sub_job_count"] = len(batch["sub_jobs"])
+
+        # Remove from jobs dict if still present
+        with jobs_lock:
+            jobs.pop(sub_job_id, None)
+
+        persist_batch(batch_id)
+        log.info("Sub-job %s removed from batch %s", sub_job_id, batch_id)
+        return {"ok": True, "sub_job_id": sub_job_id, "removed": True}
+
     # ── POST /api/batches/{batch_id}/sub-jobs/{sub_job_id}/unconfirm ──────────
 
     @r.post("/{batch_id}/sub-jobs/{sub_job_id}/unconfirm")
@@ -683,7 +722,10 @@ def _register_batch_routes(app, *, jobs, jobs_lock, batches, batches_lock,
     @r.delete("/{batch_id}")
     async def _delete_batch(batch_id: str, _=Depends(require_session)):
         """
-        Hard-delete a batch.  Only allowed if the batch has zero confirmed sub-jobs.
+        Hard-delete a batch.
+        - Archived batches: can always be deleted (ZIPs already removed at archive time).
+        - Non-archived batches: only allowed if there are zero confirmed sub-jobs
+          (to prevent accidental deletion before downloading).
         Removes from memory and from disk (BATCHES_ROOT/{batch_id}/).
         """
         with batches_lock:
@@ -691,17 +733,19 @@ def _register_batch_routes(app, *, jobs, jobs_lock, batches, batches_lock,
         if not batch:
             raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found")
 
-        confirmed_count = sum(
-            1 for sj in batch["sub_jobs"] if sj.get("status") == "confirmed"
-        )
-        if confirmed_count > 0:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Cannot delete batch with {confirmed_count} confirmed sub-job(s). "
-                    "Un-confirm or abandon all confirmed sub-jobs first."
-                ),
+        # Only block deletion of non-archived batches that still have confirmed sub-jobs
+        if not batch.get("archived", False):
+            confirmed_count = sum(
+                1 for sj in batch["sub_jobs"] if sj.get("status") == "confirmed"
             )
+            if confirmed_count > 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Cannot delete batch with {confirmed_count} confirmed sub-job(s). "
+                        "Archive the batch first (which saves the ZIP), then delete."
+                    ),
+                )
 
         # Remove from memory
         with batches_lock:

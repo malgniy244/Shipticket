@@ -163,7 +163,8 @@ function renderBatchesList(batches) {
 function _buildActionsHTML(b) {
   const ledger = b.ledger;
   const hasConfirmed = (b.sub_jobs || []).some(sj => sj.status === 'confirmed');
-  const canDelete = !hasConfirmed;
+  // Allow delete if: no confirmed sub-jobs (empty/abandoned only), OR batch is archived (ZIPs already saved)
+  const canDelete = !hasConfirmed || b.archived;
   const isArchived = b.archived;
   return `
     <button class="btn-sm primary add-file-btn" data-batch="${b.batch_id}">+ Add File</button>
@@ -237,13 +238,15 @@ function _updateBatchCardDynamic(cardEl, b) {
         ? `<button class="btn-sm danger sj-abandon-btn" data-batch="${b.batch_id}" data-sj="${sj.id}">Abandon</button>` : '';
       const unconfirmBtn = sj.status === 'confirmed'
         ? `<button class="btn-sm danger sj-unconfirm-btn" data-batch="${b.batch_id}" data-sj="${sj.id}">Un-confirm</button>` : '';
+      const removeBtn = sj.status === 'abandoned'
+        ? `<button class="btn-sm danger sj-remove-btn" data-batch="${b.batch_id}" data-sj="${sj.id}" title="Remove this abandoned sub-job from the batch">&times; Remove</button>` : '';
       return `<tr>
         <td style="font-family:monospace;font-size:.75rem;">${sj.id.slice(0,8)}&hellip;</td>
         <td>${sj.filename || '—'}</td>
         <td><span class="sj-status ${statusCls}">${statusCls}</span></td>
         <td>${sj.expected_count}</td>
         <td>${sj.total_pages || '—'}</td>
-        <td style="display:flex;gap:6px;flex-wrap:wrap;">${reviewBtn}${abandonBtn}${unconfirmBtn}</td>
+        <td style="display:flex;gap:6px;flex-wrap:wrap;">${reviewBtn}${abandonBtn}${unconfirmBtn}${removeBtn}</td>
       </tr>`;
     }).join('');
 
@@ -277,6 +280,9 @@ function _updateBatchCardDynamic(cardEl, b) {
     });
     cardEl.querySelectorAll(`.sj-unconfirm-btn[data-batch="${b.batch_id}"]`).forEach(btn => {
       btn.addEventListener('click', () => _unconfirmSubJob(b.batch_id, btn.dataset.sj));
+    });
+    cardEl.querySelectorAll(`.sj-remove-btn[data-batch="${b.batch_id}"]`).forEach(btn => {
+      btn.addEventListener('click', () => _removeSubJob(b.batch_id, btn.dataset.sj));
     });
   }
 }
@@ -428,10 +434,21 @@ function _abandonSubJob(batchId, sjId) {
 }
 
 function _unconfirmSubJob(batchId, sjId) {
-  if (!confirm(`Un-confirm sub-job ${sjId.slice(0,8)}…? This will release its tickets back to the batch pool.`)) return;
+  if (!confirm(`Un-confirm sub-job ${sjId.slice(0,8)}\u2026? This will release its tickets back to the batch pool.`)) return;
   api('POST', `/api/batches/${batchId}/sub-jobs/${sjId}/unconfirm`)
     .then(() => loadBatches())
     .catch(e => alert('Un-confirm failed: ' + e.message));
+}
+
+function _removeSubJob(batchId, sjId) {
+  if (!confirm(`Remove abandoned sub-job ${sjId.slice(0,8)}\u2026 from this batch? This cannot be undone.`)) return;
+  fetch(`/api/batches/${batchId}/sub-jobs/${sjId}`, {method: 'DELETE'})
+    .then(r => {
+      if (!r.ok) return r.text().then(t => { throw new Error(t.startsWith('<') ? 'Server error' : t); });
+      return r.json();
+    })
+    .then(() => loadBatches())
+    .catch(e => alert('Remove failed: ' + e.message));
 }
 
 // ── Multi-file dropzone and per-file expected-count table ──
