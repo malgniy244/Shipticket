@@ -527,8 +527,21 @@ def _register_batch_routes(app, *, jobs, jobs_lock, batches, batches_lock,
         persist_snapshot(sub_job_id, confirmed_snapshot)
         persist_batch(batch_id)
 
-        # Schedule cleanup of heavy files (snapshot already persisted)
-        schedule_cleanup(sub_job_id, delay=30)
+        # Copy the per-sub-job ZIP into the batch directory so it survives job cleanup.
+        # The batch download endpoint reads from BATCHES_ROOT/{batch_id}/{sub_job_id}.zip.
+        batch_sj_zip_path = BATCHES_ROOT / batch_id / f"{sub_job_id}.zip"
+        try:
+            batch_sj_zip_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(zip_path, batch_sj_zip_path)
+            with jobs_lock:
+                job["batch_zip_path"] = str(batch_sj_zip_path)
+        except Exception as exc:
+            log.warning("Sub-job %s: failed to copy ZIP to batch dir: %s", sub_job_id, exc)
+
+        # Schedule cleanup of heavy files (snapshot already persisted).
+        # Use a long TTL (24 h) so the original ZIP is still available if the
+        # batch-level copy fails for any reason.
+        schedule_cleanup(sub_job_id, delay=86400)
 
         log.info("Sub-job %s confirmed in batch %s (tickets=%s)",
                  sub_job_id, batch_id, sorted(assigned_tickets))
@@ -749,13 +762,22 @@ def _register_batch_routes(app, *, jobs, jobs_lock, batches, batches_lock,
             for sj in batch["sub_jobs"]:
                 if sj.get("status") != "confirmed":
                     continue
+                sj_id = sj["id"]
+                # Prefer the copy stored in the batch directory (survives job cleanup).
+                # Fall back to the live job's zip_path if the batch copy isn't there yet.
+                candidate_paths = [
+                    str(batch_dir / f"{sj_id}.zip"),  # batch-level copy (primary)
+                ]
                 with jobs_lock:
-                    job = jobs.get(sj["id"])
-                if not job:
-                    continue
-                zip_path = job.get("zip_path")
-                if not zip_path or not Path(zip_path).exists():
-                    # Try to find it from the snapshot store
+                    job = jobs.get(sj_id)
+                if job:
+                    live_zip = job.get("zip_path") or job.get("batch_zip_path")
+                    if live_zip:
+                        candidate_paths.append(live_zip)
+                zip_path = next((p for p in candidate_paths if Path(p).exists()), None)
+                if not zip_path:
+                    log.warning("Batch %s: no ZIP found for confirmed sub-job %s (searched: %s)",
+                                batch_id, sj_id, candidate_paths)
                     continue
                 # Add all PDFs from this sub-job's ZIP into the batch ZIP
                 try:
@@ -764,7 +786,7 @@ def _register_batch_routes(app, *, jobs, jobs_lock, batches, batches_lock,
                             batch_zf.writestr(name, sub_zf.read(name))
                 except Exception as exc:
                     log.warning("Batch %s: failed to read sub-job %s ZIP: %s",
-                                batch_id, sj["id"], exc)
+                                batch_id, sj_id, exc)
 
         # Mark batch complete
         with batches_lock:
