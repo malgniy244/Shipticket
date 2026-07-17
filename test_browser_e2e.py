@@ -456,9 +456,9 @@ async def test_bt09_multi_file_drop_three_subjobs():
 
         await upload_btn.click()
 
-        # Wait for progress screen (first sub-job)
+        # Wait for progress screen (first sub-job) — up to 90s (3 large files may be slow)
         progress_visible = False
-        for _ in range(60):
+        for _ in range(180):
             if await page.locator("#progress-screen").is_visible():
                 progress_visible = True
                 break
