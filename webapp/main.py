@@ -547,6 +547,19 @@ def run_detection_background(job_id: str):
         job_log(job_id, f"Ready — {n_blocks} block(s) found" + (f", {len(missing)} ticket(s) missing" if missing else ", all tickets matched"))
         log.info("Job %s: detection+grouping complete, %d blocks", job_id, n_blocks)
 
+        # Sync sub-job status back into the batch record (if this is a bulk sub-job)
+        _batch_id = job.get("batch_id")
+        if _batch_id:
+            with batches_lock:
+                _batch = batches.get(_batch_id)
+                if _batch:
+                    for _i, _sj in enumerate(_batch["sub_jobs"]):
+                        if _sj["id"] == job_id:
+                            _batch["sub_jobs"][_i]["status"] = "ready"
+                            break
+            if _batch:
+                persist_batch(_batch_id)
+
         # Trim large intermediate data from in-memory job to reduce RSS.
         # detection_results is already persisted to state.json and reloaded on demand.
         with jobs_lock:
@@ -565,6 +578,18 @@ def run_detection_background(job_id: str):
                 jobs[job_id]["status"] = "error"
                 jobs[job_id]["error"] = str(exc)
         persist_job(job_id)
+        # Sync error status back into the batch record (if this is a bulk sub-job)
+        _err_batch_id = job.get("batch_id") if job else None
+        if _err_batch_id:
+            with batches_lock:
+                _err_batch = batches.get(_err_batch_id)
+                if _err_batch:
+                    for _i, _sj in enumerate(_err_batch["sub_jobs"]):
+                        if _sj["id"] == job_id:
+                            _err_batch["sub_jobs"][_i]["status"] = "error"
+                            break
+            if _err_batch:
+                persist_batch(_err_batch_id)
 
 
 def build_review_state(
@@ -1441,8 +1466,18 @@ async def startup():
             batch.setdefault("archived", False)
             batch.setdefault("deleted", False)
             batch.setdefault("label", None)
+            # Sync sub-job statuses from the live jobs dict (fixes stale 'queued' status
+            # when detection completed before this sync was added)
+            needs_persist = False
+            for sj in batch.get("sub_jobs", []):
+                live_job = jobs.get(sj["id"])
+                if live_job and live_job.get("status") != sj.get("status"):
+                    sj["status"] = live_job["status"]
+                    needs_persist = True
             with batches_lock:
                 batches[batch_id] = batch
+            if needs_persist:
+                persist_batch(batch_id)
             batch_reloaded += 1
             log.info("Startup: reloaded batch %s (status=%s, sub_jobs=%d, archived=%s)",
                      batch_id, batch.get("status"), len(batch.get("sub_jobs", [])),
