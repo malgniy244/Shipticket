@@ -98,27 +98,8 @@ async def create_batch(page: Page,
     await page.click("#nb-bt-nontib")
     await page.fill("#nb-wl-input", whitelist)
 
-    # Inject label=test into the FormData via JS before the form submits
-    # We do this by intercepting the fetch call at the JS level
-    await page.evaluate("""() => {
-        const origFetch = window.fetch;
-        window._testLabelInjected = false;
-        window.fetch = function(url, opts) {
-            if (typeof url === 'string' && url.includes('/api/batches') && opts && opts.method === 'POST' && !window._testLabelInjected) {
-                window._testLabelInjected = true;
-                if (opts.body instanceof FormData) {
-                    opts.body.append('label', 'test');
-                }
-            }
-            return origFetch.apply(this, arguments);
-        };
-    }""")
-
     await page.click("#nb-submit-btn")
     await page.wait_for_selector("#bulk-screen", state="visible", timeout=10000)
-
-    # Restore original fetch
-    await page.evaluate("() => { if (window._origFetch) window.fetch = window._origFetch; }")
 
     # Wait up to 5s for the API response to be captured
     for _ in range(50):
