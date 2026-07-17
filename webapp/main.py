@@ -84,6 +84,22 @@ SNAPSHOTS_ROOT = _data_parent / "snapshots"  # confirmed_snapshot JSON per job
 FIXTURES_ROOT = _data_parent / "fixtures"    # promoted fixture PDFs + snapshots
 BATCHES_ROOT = _data_parent / "batches"      # bulk-mode batch state (permanent)
 
+# ── Asset cache-busting ──────────────────────────────────────────────────────
+# Compute a short content-hash for each versioned static asset at startup.
+# The hash is injected into index.html as a query-string version parameter so
+# browsers always fetch the latest JS/CSS after a deploy.
+import hashlib as _hashlib
+
+def _asset_hash(path: Path) -> str:
+    """Return first 12 hex chars of the SHA-256 of a file's content."""
+    try:
+        return _hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+    except Exception:
+        return "dev"
+
+_static_dir = Path(__file__).parent / "static"
+_BULK_JS_HASH = _asset_hash(_static_dir / "bulk_patch.js")
+
 # ── FastAPI app ────────────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Ship Ticket Splitter")
 
@@ -680,9 +696,12 @@ def generate_thumbnails(job_id: str, pdf_path: str, thumb_dir: str):
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    """Redirect to login or app."""
+    """Serve index.html with cache-busted asset URLs injected."""
     html = Path(__file__).parent / "static" / "index.html"
-    return HTMLResponse(content=html.read_text(), status_code=200)
+    content = html.read_text()
+    # Replace the placeholder hash with the actual content hash computed at startup
+    content = content.replace("__BULK_JS_HASH__", _BULK_JS_HASH)
+    return HTMLResponse(content=content, status_code=200)
 
 
 @app.post("/api/login")
