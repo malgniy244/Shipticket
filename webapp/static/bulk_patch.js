@@ -153,6 +153,8 @@ function renderBatchesList(batches) {
       div.innerHTML = renderBatchCard(b);
       const card = div.firstElementChild;
       container.prepend(card);
+      // Immediately hydrate the sub-job table so it doesn't show the placeholder
+      _updateBatchCardDynamic(card, b);
       attachBatchCardListeners(b);
     }
   });
@@ -408,6 +410,8 @@ function _reviewSubJob(batchId, sjId) {
     })
     .then(rs => {
       reviewState = rs;
+      // Set totalPages from review state so renderPhaseA can build the thumbnail strip
+      if (rs.total_pages) totalPages = rs.total_pages;
       hideBulkScreens();
       hide('new-job-screen');
       el('main-area').style.display = '';
