@@ -89,7 +89,10 @@ el('nb-submit-btn').addEventListener('click', async () => {
 });
 
 // ── Batch dashboard ──
+let _batchFormOpen = false;  // true while any add-file form is expanded or uploading
+
 async function loadBatches() {
+  if (_batchFormOpen) return;  // don't wipe the form while user is filling it in
   try {
     const batches = await api('GET', '/api/batches');
     renderBatchesList(batches);
@@ -203,7 +206,9 @@ function attachBatchCardListeners(b) {
   const addBtn = document.querySelector(`.add-file-btn[data-batch="${batchId}"]`);
   if (addBtn) addBtn.addEventListener('click', () => {
     const form = el(`add-sj-form-${batchId}`);
+    const opening = form.classList.contains('hidden');
     form.classList.toggle('hidden');
+    _batchFormOpen = opening;  // pause poll when form opens, resume when it closes
   });
 
   // Sub-job upload form validation
@@ -225,6 +230,7 @@ function attachBatchCardListeners(b) {
       errEl.classList.add('hidden');
       uploadBtn.disabled = true;
       uploadBtn.innerHTML = '<span class="spinner"></span>Uploading…';
+      _batchFormOpen = true;  // keep poll paused during upload
       try {
         const fd = new FormData();
         fd.append('file', pdf);
@@ -232,6 +238,7 @@ function attachBatchCardListeners(b) {
         const r = await fetch(`/api/batches/${batchId}/sub-jobs`, {method:'POST', body: fd});
         if (!r.ok) { const t = await r.text(); throw new Error(t.startsWith('<') ? 'Server error' : t); }
         const d = await r.json();
+        _batchFormOpen = false;  // upload complete — resume poll
         // Enter single-job review flow for this sub-job
         activeBatchId = batchId;
         activeSubJobId = d.sub_job_id;
@@ -250,6 +257,7 @@ function attachBatchCardListeners(b) {
         el('main-area').style.display = '';
         pollStatus();
       } catch(e) {
+        _batchFormOpen = false;  // resume poll on error too
         const errEl2 = el(`sj-error-${batchId}`);
         errEl2.textContent = 'Error: ' + e.message;
         errEl2.classList.remove('hidden');
@@ -263,6 +271,7 @@ function attachBatchCardListeners(b) {
   const cancelBtn = document.querySelector(`.sj-cancel-btn[data-batch="${batchId}"]`);
   if (cancelBtn) cancelBtn.addEventListener('click', () => {
     el(`add-sj-form-${batchId}`).classList.add('hidden');
+    _batchFormOpen = false;  // resume poll when form is cancelled
   });
 
   // Review sub-job

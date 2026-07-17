@@ -249,6 +249,7 @@ def _register_batch_routes(app, *, jobs, jobs_lock, batches, batches_lock,
                 "batch_type": b["batch_type"],
                 "whitelist_count": len(b["whitelist"]),
                 "sub_job_count": len(b["sub_jobs"]),
+                "sub_jobs": b["sub_jobs"],
                 "created_at": b["created_at"],
                 "ledger": batch_ledger_summary(b),
             }
